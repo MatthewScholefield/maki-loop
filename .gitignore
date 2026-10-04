@@ -1,0 +1,10 @@
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+.maki/
+.DS_Store
+*.swp
+*.swo
+*~
