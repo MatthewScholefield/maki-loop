@@ -164,7 +164,20 @@ local function host(files, json)
     return h.prompt_result or "started"
   end
   _G.maki = m
-  dofile("lua/loop.lua")
+  local modules = {}
+  local env = setmetatable({ maki = m }, { __index = _G })
+  env.require = function(name)
+    eq(name, "loop")
+    if not modules[name] then
+      local module = assert(loadfile("lua/" .. name .. ".lua"))
+      setfenv(module, env)
+      modules[name] = module() or true
+    end
+    return modules[name]
+  end
+  local entry = assert(loadfile("plugin/loop.lua"))
+  setfenv(entry, env)
+  entry()
   return h
 end
 
@@ -175,6 +188,19 @@ local function test(name, fn)
   count = count + 1
   print("ok " .. count .. " - " .. name)
 end
+
+test("package entrypoint registers loop commands, tool, and lifecycle hooks", function()
+  local h = host()
+  for _, name in ipairs({ "loop", "loop-stop", "loop-status", "loop-resume" }) do
+    assert(h.commands[name], "missing command: " .. name)
+  end
+  assert(h.tools.loop_complete)
+  for _, event in ipairs({ "TurnStart", "TurnEnd", "TurnError", "SessionStatusChanged", "TaskStatusChanged", "SessionEnd", "SessionReset" }) do
+    assert(h.events[event], "missing event: " .. event)
+  end
+  eq(#h.prompts, 0)
+  eq(h.created, 0)
+end)
 
 local function started()
   local h = host()
