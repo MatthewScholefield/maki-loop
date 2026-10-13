@@ -53,7 +53,7 @@ The agent calls `loop_complete` when the whole objective is done.
 
 - `/loop-status` — show progress and reported cost.
 - `/loop-stop` — stop continuation without cancelling current work.
-- `/loop-resume` — resume a stopped or interrupted loop in a fresh session.
+- `/loop-resume` — resume a stopped or interrupted loop in a fresh session. During an active turn, arm continuation for when that turn finishes normally without cancelling it.
 
 Errors, cancellation, or conflicting user work interrupt continuation. Restarting or reloading requires an explicit resume.
 

@@ -287,6 +287,125 @@ test("stop keeps work, explicit fresh resume", function()
   eq(h.created, 1); eq(h.saved().iteration, 2); eq(#h.prompts, 2)
 end)
 
+for _, status in ipairs({ "working", "needs_input" }) do
+  test("resume during " .. status .. " waits for normal finish and idle", function()
+    local h = started()
+    h.command("loop-stop")
+    h.sessions.s1.status = status
+    h.command("loop-resume"); h.tick()
+    eq(h.sessions.s1.status, status)
+    eq(h.saved().status, "running"); eq(h.created, 0); eq(#h.prompts, 1)
+    h.command("loop-resume"); eq(h.created, 0)
+    h.sessions.s1.status = "working"
+    h.emit("SessionStatusChanged", { session_id = "s1", status = "working" })
+    h.drain(); h.tick(); eq(h.created, 0)
+    h.finish("finished", "working"); h.tick(); eq(h.created, 0)
+    h.sessions.s1.status = "idle"
+    h.emit("SessionStatusChanged", { session_id = "s1", status = "idle" })
+    h.drain(); h.tick(); h.tick()
+    eq(h.created, 1); eq(#h.prompts, 2); eq(h.saved().iteration, 2)
+    eq(h.saved().cost, 0.25); eq(h.saved().cost_reports, 1)
+    eq(h.saved().resume_parent, nil)
+    h.finish(); h.tick(); eq(h.created, 2)
+  end)
+end
+
+test("resume adopts a manual turn after interruption", function()
+  local h = started(); h.finish("cancelled")
+  h.sessions.s1.status = "working"
+  h.emit("TurnStart", { session_id = "s1", text = "continue the work" }); h.drain()
+  h.command("loop-resume"); h.tick(); eq(h.created, 0)
+  h.finish(); h.tick()
+  eq(h.created, 1); eq(h.saved().cost, 0.5); eq(h.saved().cost_reports, 2)
+end)
+
+test("resume waits for focused turn rather than old owner", function()
+  local h = started(); h.command("loop-stop")
+  h.sessions.other = copy(h.sessions.s1)
+  h.sessions.other.id = "other"
+  h.sessions.other.settings = { spec = "other", thinking = "off", fast = true }
+  h.focus = "other"
+  h.command("loop-resume")
+  eq(h.saved().owner, "s1"); eq(h.saved().sessions[1].id, "s1")
+  eq(h.complete("old owner finished", "s1").is_error, true)
+  h.finish("finished", "idle", "s1"); h.tick(); eq(h.created, 0)
+  h.finish("finished", "idle", "other"); h.tick()
+  eq(h.created, 1); eq(h.saved().iteration, 2); eq(h.saved().owner, "n1")
+  eq(h.sessions.n1.settings.spec, "other"); eq(h.saved().cost_reports, 1)
+end)
+
+for _, point in ipairs({ "read", "mkdir", "write" }) do
+  test("finish racing resume at " .. point .. " is not lost", function()
+    local h = started(); h.command("loop-stop")
+    local fired = false
+    h.hook = function(name)
+      if fired or name ~= point then return end
+      fired = true
+      h.sessions.s1.status = "idle"
+      h.emit("TurnEnd", { session_id = "s1", reason = "finished", cost = 0.25 })
+    end
+    h.command("loop-resume"); h.tick(); h.tick()
+    eq(h.created, 1); eq(#h.prompts, 2)
+  end)
+end
+
+for _, action in ipairs({ "stop", "cancelled", "error", "queued", "task", "manual", "reload", "write" }) do
+  test("armed resume is revoked by " .. action, function()
+    local h = started(); h.command("loop-stop")
+    if action == "write" then h.fail.write = "disk full" end
+    h.command("loop-resume")
+    h.fail.write = nil
+    if action == "stop" then h.command("loop-stop")
+    elseif action == "error" then h.emit("TurnError", { session_id = "s1", message = "provider failed" })
+    elseif action == "queued" then h.sessions.s1.queue.count = 1
+    elseif action == "task" then h.sessions.s1.tasks[2] = { id = "sub", status = "working" }
+    elseif action == "manual" then h.emit("TurnStart", { session_id = "s1" })
+    elseif action == "reload" then h.emit("SessionEnd", { session_id = "s1", reason = "reload" }) end
+    h.drain(); h.finish(action == "cancelled" and "cancelled" or "finished"); h.tick()
+    eq(h.created, 0); eq(#h.prompts, 1)
+    eq(h.saved().status, action == "stop" and "stopped" or "interrupted")
+  end)
+end
+
+test("stop racing busy resume persistence revokes continuation", function()
+  local h = started(); h.command("loop-stop")
+  local fired = false
+  h.hook = function(name)
+    if fired or name ~= "write" then return end
+    fired = true
+    h.spawn(function() h.commands["loop-stop"].handler({}) end)
+  end
+  h.command("loop-resume"); h.finish(); h.tick()
+  eq(h.saved().status, "stopped"); eq(h.created, 0); eq(#h.prompts, 1)
+end)
+
+test("owning turn can complete an armed resume", function()
+  local h = started(); h.command("loop-stop"); h.command("loop-resume")
+  assert(not h.complete("all verified", "s1").is_error)
+  h.finish(); h.tick(); eq(h.created, 0); eq(h.saved().status, "completed")
+end)
+
+for _, case in ipairs({ "queued", "plan", "headless", "wrong" }) do
+  test("busy resume still rejects " .. case, function()
+    local h = started(); h.command("loop-stop")
+    if case == "queued" then h.sessions.s1.queue.count = 1
+    elseif case == "plan" then h.sessions.s1.mode = "plan"
+    elseif case == "headless" then h.sessions.s1.queue = nil
+    else h.sessions.s1.cwd = "/elsewhere" end
+    h.command("loop-resume"); h.finish(); h.tick()
+    eq(h.created, 0); eq(h.saved().status, "stopped")
+  end)
+end
+
+test("reload can resume an in-flight turn explicitly", function()
+  local h = started(); h.command("loop-stop"); h.command("loop-resume")
+  local reload = host(h.files, h.json)
+  reload.sessions.s1.status = "working"
+  reload.command("loop-status"); eq(reload.saved().status, "interrupted")
+  reload.command("loop-resume"); reload.tick(); eq(reload.created, 0)
+  reload.finish(); reload.tick(); eq(reload.created, 1)
+end)
+
 test("question suspension and answer do not end iteration", function()
   local h = started()
   h.sessions.s1.status = "needs_input"
@@ -394,7 +513,7 @@ test("reload requires resume, project isolation and normalized keys", function()
   eq(n, 2)
 end)
 
-for _, corrupt in ipairs({ "json", "version", "owner", "cost", "objective", "records", "summary", "cwd",
+for _, corrupt in ipairs({ "json", "version", "owner", "cost", "objective", "records", "summary", "cwd", "resume_parent",
   "sparse", "object", "mixed", "zero", "negative", "fractional", "extra", "empty" }) do
   test("reject corrupt state " .. corrupt, function()
     local h = started()
@@ -403,6 +522,7 @@ for _, corrupt in ipairs({ "json", "version", "owner", "cost", "objective", "rec
     if corrupt == "json" then h.files[path] = "broken"
     elseif corrupt == "version" then s.version = 99
     elseif corrupt == "owner" then s.owner = "wrong"
+    elseif corrupt == "resume_parent" then s.resume_parent = {}
     elseif corrupt == "cost" then s.cost = -1
     elseif corrupt == "objective" then s.objective = " "
     elseif corrupt == "records" then s.sessions[1].iteration = 3

@@ -19,6 +19,7 @@ local function valid(s, cwd)
     and statuses[s.status] and type(s.cost) == "number" and s.cost >= 0 and s.cost < math.huge
     and integer(s.cost_reports) and type(s.sessions) == "table"
     and (s.reason == nil or type(s.reason) == "string")
+    and (s.resume_parent == nil or nonblank(s.resume_parent))
     and (s.summary == nil or nonblank(s.summary))
     and (s.status ~= "completed" or nonblank(s.summary))
 end
@@ -174,7 +175,7 @@ local function fresh(s, guard, parent)
   local id = call(s, guard, maki.session.new, { focus = false })
   if not id then return end
   s.owner, s.iteration, s.status = id, s.iteration + 1, "running"
-  s.reason, s.ended, s.expect_start, s.tasks = nil, false, false, {}
+  s.reason, s.ended, s.expect_start, s.tasks, s.resume_parent = nil, false, false, {}, nil
   s.sessions[#s.sessions + 1] = { id = id, iteration = s.iteration }
   guard = token(s)
   local saved = call(s, guard, persist, s)
@@ -200,11 +201,12 @@ schedule = function(s)
     timer = nil
     if not guard() then return end
     s.handoff = true
-    local snapshot = call(s, guard, maki.session.read, { session = s.owner })
+    local parent = s.resume_parent or s.owner
+    local snapshot = call(s, guard, maki.session.read, { session = parent })
     if snapshot then
       local reason = check(snapshot, s.cwd, false)
       if reason then interrupt(s, reason)
-      elseif snapshot.status == "idle" then fresh(s, guard, s.owner) end
+      elseif snapshot.status == "idle" then fresh(s, guard, parent) end
     end
     s.handoff = false
     if s.wake then s.wake = false; schedule(s) end
@@ -238,7 +240,7 @@ local function start(opts, resume)
   local snapshot
   snapshot, err = maki.session.read({ session = parent })
   if err or not snapshot then maki.notify(tostring(err), "error"); return end
-  local reason = check(snapshot, cwd, true)
+  local reason = check(snapshot, cwd, not resume)
   if reason then maki.notify(reason, "warn"); return end
   if closed or command_generation ~= command_token then return end
   if not resume then
@@ -248,12 +250,24 @@ local function start(opts, resume)
   end
   s.generation, s.status, s.reason = s.generation + 1, "running", nil
   s.ended, s.expect_start, s.tasks = false, false, {}
+  s.resume_parent = resume and snapshot.status ~= "idle" and parent or nil
   states[cwd], active = s, s
   local guard = token(s)
   if not call(s, guard, persist, s) then return end
   maki.notify("Loop starting: unlimited iterations/spend; no automatic progress guarantee. Prior transcripts/tabs are retained. Use /loop-stop to revoke continuation.", "warn")
   if not guard() then return end
-  if resume then fresh(s, guard, parent) else submit(s, guard) end
+  if s.resume_parent then
+    maki.notify("Loop resume armed; continuation will start in a fresh session after the current turn finishes normally.")
+    local latest = call(s, guard, maki.session.read, { session = s.resume_parent })
+    if not latest then return end
+    reason = check(latest, cwd, false)
+    if reason then interrupt(s, reason); return end
+    if s.status == "running" and latest.status == "idle" then
+      s.status = "rollover_pending"
+      if not call(s, guard, persist, s) then return end
+    end
+    schedule(s)
+  elseif resume then fresh(s, guard, parent) else submit(s, guard) end
 end
 
 command("loop", "+", function(opts) start(opts, false) end)
@@ -288,7 +302,8 @@ maki.api.register_tool({
   schema = { type = "object", properties = { summary = { type = "string" } }, required = { "summary" }, additionalProperties = false },
   handler = function(input, ctx)
     local s = active
-    if closed or not s or ctx:task_id() ~= "main" or ctx:session_id() ~= s.owner or not nonblank(input.summary)
+    if closed or not s or ctx:task_id() ~= "main" or ctx:session_id() ~= s.owner
+      or (s.resume_parent and s.resume_parent ~= s.owner) or not nonblank(input.summary)
       or (not eligible(s) and s.status ~= "completed") then
       return { llm_output = "No matching active main-agent loop, or empty summary", is_error = true }
     end
@@ -315,7 +330,7 @@ maki.api.create_autocmd({ "TurnStart", "TurnEnd", "TurnError", "SessionStatusCha
       if eligible(s) then interrupt(s, "Session teardown: " .. d.reason, true) end
       return
     end
-    if not s or d.session_id ~= s.owner then return end
+    if not s or d.session_id ~= (s.resume_parent or s.owner) then return end
     if ev.event == "TurnEnd" and not s.ended then
       s.ended = true
       if type(d.cost) == "number" and d.cost >= 0 and d.cost < math.huge then
