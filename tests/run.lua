@@ -153,6 +153,12 @@ local function host(files, json)
     h.sessions[s.id] = s
     return s.id
   end
+  m.session.set_mode = function(mode, opts)
+    local err = ui("mode")
+    if err then return nil, err end
+    h.sessions[opts.session].mode = mode
+    return true
+  end
   m.session.prompt = function(text, opts)
     local err = ui("prompt")
     if err then return nil, err end
@@ -236,13 +242,10 @@ test("raw objective, current context, fresh inheritance, duplicates, cost", func
   eq(h.created, 1); eq(h.saved().cost, 0.25)
 end)
 
-for _, case in ipairs({ "blank", "busy", "queued", "plan", "headless", "wrong" }) do
+for _, case in ipairs({ "blank", "headless", "wrong" }) do
   test("reject start " .. case, function()
     local h = host()
     local s = h.sessions.s1
-    if case == "busy" then s.status = "working" end
-    if case == "queued" then s.queue.count = 1 end
-    if case == "plan" then s.mode = "plan" end
     if case == "headless" then s.queue = nil end
     if case == "wrong" then s.cwd = "/elsewhere" end
     h.command("loop", case == "blank" and " \n " or "work")
@@ -250,14 +253,166 @@ for _, case in ipairs({ "blank", "busy", "queued", "plan", "headless", "wrong" }
   end)
 end
 
-test("duplicate commands and unrelated lifecycle", function()
+test("replacement commands and unrelated lifecycle", function()
   local h = started()
   h.command("loop", "different")
-  eq(h.saved().objective, "do the work")
+  eq(h.saved().objective, "different")
+  eq(h.saved().owner, "n1"); eq(h.saved().iteration, 1)
+  eq(#h.prompts, 2)
+  eq(h.sessions.s1.status, "working")
   for _, e in ipairs({ "TurnEnd", "TurnError", "SessionReset", "SessionEnd" }) do
     h.emit(e, { session_id = "other", reason = "finished" })
   end
-  h.drain(); h.tick(); eq(h.saved().status, "running"); eq(h.created, 0)
+  h.drain(); h.tick(); eq(h.saved().status, "running"); eq(h.created, 1)
+end)
+
+for _, status in ipairs({ "running", "rollover_pending", "stopped", "interrupted", "completed", "rewound" }) do
+  test("new loop replaces " .. status, function()
+    local h = started()
+    if status == "rollover_pending" then h.finish()
+    elseif status == "stopped" then h.command("loop-stop")
+    elseif status == "interrupted" then h.finish("cancelled")
+    elseif status == "completed" then h.complete("done")
+    elseif status == "rewound" then h.sessions.s1.status = "idle" end
+    h.command("loop", "foo bar baz"); h.tick()
+    eq(h.saved().objective, "foo bar baz"); eq(h.saved().status, "running")
+    eq(h.saved().iteration, 1); eq(h.saved().cost, 0); eq(h.saved().summary, nil)
+    eq(h.created, 1); eq(#h.prompts, 2)
+    eq(h.prompts[2].text:sub(-11), "foo bar baz")
+    eq(h.complete("old completion", "s1").is_error, true)
+    h.finish("cancelled", "idle", "s1"); h.tick()
+    eq(h.saved().status, "running"); eq(h.saved().cost, 0)
+    h.finish(); h.tick()
+    eq(h.created, 2); eq(#h.prompts, 3)
+    eq(h.saved().objective, "foo bar baz"); eq(h.saved().iteration, 2)
+  end)
+end
+
+for _, status in ipairs({ "working", "needs_input", "queued", "plan" }) do
+  test("new loop starts immediately from " .. status, function()
+    local h = host()
+    if status == "queued" then h.sessions.s1.queue.count = 2
+    elseif status == "plan" then h.sessions.s1.mode = "plan"
+    else h.sessions.s1.status = status end
+    h.sessions.s1.tasks[2] = { id = "sub", status = "working" }
+    local before = copy(h.sessions.s1)
+    h.command("loop", "new objective")
+    eq(h.created, 1); eq(#h.prompts, 1)
+    eq(h.saved().owner, "n1"); eq(h.saved().iteration, 1)
+    eq(h.sessions.n1.mode, "build")
+    eq(h.sessions.s1.status, before.status); eq(h.sessions.s1.mode, before.mode)
+    eq(h.sessions.s1.queue.count, before.queue.count)
+  end)
+end
+
+test("new loop replaces corrupt saved state without reading it", function()
+  local h = started()
+  local path = next(h.files)
+  h.files[path] = "broken"
+  local reload = host(h.files, h.json)
+  reload.command("loop", "replacement")
+  eq(#reload.prompts, 1); eq(reload.saved().objective, "replacement")
+  eq(reload.calls.fs_read, nil)
+end)
+
+for _, point in ipairs({ "current", "read", "mkdir", "write", "prompt" }) do
+  test("new loop supersedes initial startup at " .. point, function()
+    local h = host()
+    local fired = false
+    h.hook = function(name)
+      if fired or name ~= point then return end
+      fired = true
+      h.spawn(function() h.commands.loop.handler({ args = "latest objective" }) end)
+    end
+    h.command("loop", "old objective"); h.tick()
+    assert(fired)
+    eq(h.saved().objective, "latest objective"); eq(h.saved().status, "running")
+    eq(h.prompts[#h.prompts].text:sub(-16), "latest objective")
+    eq(#h.prompts, point == "prompt" and 2 or 1)
+  end)
+end
+
+for _, point in ipairs({ "read", "focus", "current", "tasks", "model", "new", "mkdir", "write", "prompt" }) do
+  test("new loop supersedes deferred handoff at " .. point, function()
+    local h = started(); h.finish()
+    local fired = false
+    h.hook = function(name)
+      if fired or name ~= point then return end
+      fired = true
+      h.spawn(function() h.commands.loop.handler({ args = "replacement" }) end)
+    end
+    h.tick(); h.tick()
+    assert(fired)
+    eq(h.saved().objective, "replacement"); eq(h.saved().status, "running")
+    eq(h.saved().iteration, 1)
+    eq(h.prompts[#h.prompts].text:sub(-11), "replacement")
+    h.finish(); h.tick()
+    eq(h.saved().objective, "replacement"); eq(h.saved().iteration, 2)
+  end)
+end
+
+for _, point in ipairs({ "current", "read", "focus", "model", "new", "mode", "mkdir", "write", "prompt" }) do
+  test("new loop supersedes replacement startup at " .. point, function()
+    local h = started()
+    local fired = false
+    h.hook = function(name)
+      if fired or name ~= point then return end
+      fired = true
+      h.spawn(function() h.commands.loop.handler({ args = "latest" }) end)
+    end
+    h.command("loop", "superseded"); h.tick()
+    assert(fired)
+    eq(h.saved().objective, "latest"); eq(h.saved().status, "running")
+    eq(h.saved().iteration, 1)
+    eq(h.prompts[#h.prompts].text:sub(-6), "latest")
+  end)
+end
+
+test("old owner cannot complete or cancel replacement during startup", function()
+  local h = started()
+  local result
+  h.hook = function(name)
+    if name ~= "new" then return end
+    h.spawn(function()
+      result = h.tools.loop_complete.handler({ summary = "old work done" }, {
+        session_id = function() return "s1" end, task_id = function() return "main" end,
+      })
+    end)
+    h.emit("TurnEnd", { session_id = "s1", reason = "cancelled", cost = 9 })
+  end
+  h.command("loop", "replacement")
+  eq(result.is_error, true)
+  eq(h.saved().status, "running"); eq(h.saved().cost, 0); eq(#h.prompts, 2)
+end)
+
+for _, point in ipairs({ "metadata", "fs_read", "mkdir", "write", "new" }) do
+  test("new loop supersedes resume at " .. point, function()
+    local old = started(); old.command("loop-stop")
+    local h = host(old.files, old.json)
+    local fired = false
+    h.hook = function(name)
+      if fired or name ~= point then return end
+      fired = true
+      h.spawn(function() h.commands.loop.handler({ args = "replacement" }) end)
+    end
+    h.command("loop-resume"); h.tick()
+    assert(fired)
+    eq(h.saved().objective, "replacement"); eq(h.saved().status, "running")
+    eq(h.prompts[#h.prompts].text:sub(-11), "replacement")
+  end)
+end
+
+test("latest of three overlapping starts wins", function()
+  local h = host()
+  local launches = 0
+  h.hook = function(name)
+    if name ~= "read" or launches == 2 then return end
+    launches = launches + 1
+    local objective = "replacement " .. launches
+    h.spawn(function() h.commands.loop.handler({ args = objective }) end)
+  end
+  h.command("loop", "old"); h.tick()
+  eq(h.saved().objective, "replacement 2"); eq(#h.prompts, 1)
 end)
 
 test("completion ownership, summary, main-only, durable idempotence", function()
@@ -538,6 +693,9 @@ for _, corrupt in ipairs({ "json", "version", "owner", "cost", "objective", "rec
     elseif corrupt == "cwd" then s.cwd = "/wrong" end
     local reload = host(h.files, h.json)
     reload.command("loop-resume"); reload.tick(); eq(#reload.prompts, 0); eq(reload.created, 0)
+    reload.command("loop", "new objective")
+    eq(#reload.prompts, 1); eq(reload.saved().objective, "new objective")
+    eq(reload.saved().status, "running")
   end)
 end
 

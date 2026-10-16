@@ -47,7 +47,7 @@ Accept the removal prompt. Close any other maki processes still using the packag
 /loop Finish the tasks in TASKS.md. Record progress there and verify each change.
 ```
 
-The first iteration uses your current session. After each normally finished turn, the plugin opens a fresh session with the same model settings and repeats the original objective. No previous transcript or summary is passed along, so it's meant for you to keep your ongoing task state / progress within some markdown file you reference in your prompt.
+`/loop` always starts a new objective, replacing any previous loop and revoking its pending continuation. The first iteration uses your current session when it is idle in build mode with no queued work or previous loop state. Otherwise it opens a fresh build-mode session immediately, leaving existing work and queued input untouched. After each normally finished turn, the plugin opens a fresh session with the same model settings and repeats the original objective. No previous transcript or summary is passed along, so it's meant for you to keep your ongoing task state / progress within some markdown file you reference in your prompt.
 
 The agent calls `loop_complete` when the whole objective is done.
 

@@ -35,6 +35,7 @@ end
 
 local function persist(s)
   local permit = writes:acquire()
+  if states[s.cwd] ~= s then permit:release(); return nil, "revoked" end
   local dir, err = location(s.cwd)
   if dir then
     local ok
@@ -74,7 +75,7 @@ end
 local function token(s)
   local generation, owner, iteration = s.generation, s.owner, s.iteration
   return function()
-    return not closed and eligible(s) and s.generation == generation and s.owner == owner and s.iteration == iteration
+    return not closed and active == s and eligible(s) and s.generation == generation and s.owner == owner and s.iteration == iteration
   end
 end
 
@@ -89,15 +90,21 @@ local function call(s, guard, fn, ...)
   return value
 end
 
-local function check(snapshot, cwd, idle)
+local function environment(snapshot, cwd)
   if type(snapshot.queue) ~= "table" then return "Interactive TUI required; headless/SDK/ACP are unsupported" end
   if maki.fs.normalize(snapshot.cwd) ~= cwd then return "Wrong project" end
+end
+
+local function check(snapshot, cwd, idle)
+  local reason = environment(snapshot, cwd)
+  if reason then return reason end
   if snapshot.mode ~= "build" then return "Switch to build mode before using loop" end
   if snapshot.queue.count ~= 0 then return "Queued user work" end
   if idle and snapshot.status ~= "idle" then return "Session is busy" end
 end
 
 local function project()
+  local generation = command_generation
   local cwd, err = maki.uv.cwd()
   if err or not cwd then return nil, nil, err or "cwd unavailable" end
   cwd = maki.fs.normalize(cwd)
@@ -124,6 +131,7 @@ local function project()
     count = count + 1
   end
   if count ~= s.iteration or s.sessions[s.iteration].id ~= s.owner then return nil, cwd, "Invalid owner record" end
+  if closed or command_generation ~= generation then return nil, cwd, "revoked" end
   states[cwd] = s
   if eligible(s) then
     revoke(s, "interrupted", "Restart/reload requires explicit /loop-resume")
@@ -145,7 +153,7 @@ local function submit(s, guard)
   if result and result ~= "started" then interrupt(s, "Prompt was queued instead of started") end
 end
 
-local function fresh(s, guard, parent)
+local function fresh(s, guard, parent, initial)
   local ok = call(s, guard, maki.session.focus, parent)
   if not ok then return end
   local current = call(s, guard, maki.session.current)
@@ -153,15 +161,18 @@ local function fresh(s, guard, parent)
   if current ~= parent then interrupt(s, "Focus changed during handoff"); return end
   local snapshot = call(s, guard, maki.session.read, { session = parent })
   if not snapshot then return end
-  local reason = check(snapshot, s.cwd, true)
+  local reason
+  if initial then reason = environment(snapshot, s.cwd) else reason = check(snapshot, s.cwd, true) end
   if reason then interrupt(s, reason); return end
-  for _, status in pairs(s.tasks) do
-    if status == "working" then interrupt(s, "Active subagent during handoff"); return end
-  end
-  local tasks = call(s, guard, maki.task.list)
-  if not tasks then return end
-  for _, task in ipairs(tasks) do
-    if task.id ~= "main" and task.status == "working" then interrupt(s, "Active subagent during handoff"); return end
+  if not initial then
+    for _, status in pairs(s.tasks) do
+      if status == "working" then interrupt(s, "Active subagent during handoff"); return end
+    end
+    local tasks = call(s, guard, maki.task.list)
+    if not tasks then return end
+    for _, task in ipairs(tasks) do
+      if task.id ~= "main" and task.status == "working" then interrupt(s, "Active subagent during handoff"); return end
+    end
   end
   local model = call(s, guard, maki.model.get)
   if not model then return end
@@ -170,14 +181,15 @@ local function fresh(s, guard, parent)
   if current ~= parent then interrupt(s, "Focus changed before creation"); return end
   snapshot = call(s, guard, maki.session.read, { session = parent })
   if not snapshot then return end
-  reason = check(snapshot, s.cwd, true)
+  if initial then reason = environment(snapshot, s.cwd) else reason = check(snapshot, s.cwd, true) end
   if reason then interrupt(s, reason); return end
   local id = call(s, guard, maki.session.new, { focus = false })
   if not id then return end
-  s.owner, s.iteration, s.status = id, s.iteration + 1, "running"
-  s.reason, s.ended, s.expect_start, s.tasks, s.resume_parent = nil, false, false, {}, nil
-  s.sessions[#s.sessions + 1] = { id = id, iteration = s.iteration }
+  s.owner, s.iteration, s.status = id, initial and 1 or s.iteration + 1, "running"
+  s.reason, s.ended, s.expect_start, s.tasks, s.resume_parent, s.starting = nil, false, false, {}, nil, nil
+  s.sessions[s.iteration] = { id = id, iteration = s.iteration }
   guard = token(s)
+  if initial and not call(s, guard, maki.session.set_mode, "build", { session = id }) then return end
   local saved = call(s, guard, persist, s)
   if not saved then return end
   ok = call(s, guard, maki.session.focus, id)
@@ -216,23 +228,31 @@ end
 local function command(name, nargs, handler)
   maki.api.register_command({ name = name, nargs = nargs, description = name, handler = function(opts)
     if closed then return end
-    if loading then maki.notify("Loop command already in progress", "warn"); return end
-    loading = true
-    local ok, err = pcall(handler, opts)
-    loading = false
-    if not ok then
+    if name == "loop" then
+      if not nonblank(opts.args) then maki.notify("A nonblank objective is required", "warn"); return end
+      command_generation = command_generation + 1
+      if eligible(active) then revoke(active, "stopped", "Superseded by a new /loop") end
+    elseif loading then maki.notify("Loop command already in progress", "warn"); return end
+    local generation, pending = command_generation, {}
+    loading = pending
+    local ok, err = pcall(handler, opts, generation)
+    if loading == pending then loading = false end
+    if not ok and command_generation == generation then
       if eligible(active) then interrupt(active, tostring(err)) end
       maki.notify("Loop error: " .. tostring(err), "error")
     end
   end })
 end
 
-local function start(opts, resume)
-  local command_token = command_generation
-  if not resume and not nonblank(opts.args) then maki.notify("A nonblank objective is required", "warn"); return end
-  local s, cwd, err = project()
-  if err then maki.notify(tostring(err), "error"); return end
-  if eligible(active) or eligible(s) then maki.notify("A loop is already active", "warn"); return end
+local function start(opts, resume, command_token)
+  local s, cwd, err
+  if resume then s, cwd, err = project()
+  else
+    cwd, err = maki.uv.cwd()
+    if cwd then cwd = maki.fs.normalize(cwd); s = states[cwd] end
+  end
+  if err or not cwd then maki.notify(tostring(err or "cwd unavailable"), "error"); return end
+  if resume and (eligible(active) or eligible(s)) then maki.notify("A loop is already active", "warn"); return end
   if resume and (not s or s.status == "completed") then maki.notify("No resumable loop in this project", "warn"); return end
   local parent
   parent, err = maki.session.current()
@@ -240,16 +260,19 @@ local function start(opts, resume)
   local snapshot
   snapshot, err = maki.session.read({ session = parent })
   if err or not snapshot then maki.notify(tostring(err), "error"); return end
-  local reason = check(snapshot, cwd, not resume)
+  local reason
+  if resume then reason = check(snapshot, cwd, false) else reason = environment(snapshot, cwd) end
   if reason then maki.notify(reason, "warn"); return end
   if closed or command_generation ~= command_token then return end
+  local initial = not resume and (s ~= nil or active ~= nil or snapshot.status ~= "idle"
+    or snapshot.queue.count ~= 0 or snapshot.mode ~= "build")
   if not resume then
     s = { version = 1, cwd = cwd, objective = opts.args, id = parent .. ":" .. tostring(snapshot.updated_at),
       generation = 0, iteration = 1, owner = parent, cost = 0, cost_reports = 0,
       sessions = { { id = parent, iteration = 1 } } }
   end
   s.generation, s.status, s.reason = s.generation + 1, "running", nil
-  s.ended, s.expect_start, s.tasks = false, false, {}
+  s.ended, s.expect_start, s.tasks, s.starting = false, false, {}, initial or nil
   s.resume_parent = resume and snapshot.status ~= "idle" and parent or nil
   states[cwd], active = s, s
   local guard = token(s)
@@ -267,11 +290,11 @@ local function start(opts, resume)
       if not call(s, guard, persist, s) then return end
     end
     schedule(s)
-  elseif resume then fresh(s, guard, parent) else submit(s, guard) end
+  elseif resume or initial then fresh(s, guard, parent, initial) else submit(s, guard) end
 end
 
-command("loop", "+", function(opts) start(opts, false) end)
-command("loop-resume", 0, function(opts) start(opts, true) end)
+command("loop", "+", function(opts, generation) start(opts, false, generation) end)
+command("loop-resume", 0, function(opts, generation) start(opts, true, generation) end)
 command("loop-status", 0, function()
   local s, _, err = project()
   if err then maki.notify(tostring(err), "error"); return end
@@ -302,7 +325,7 @@ maki.api.register_tool({
   schema = { type = "object", properties = { summary = { type = "string" } }, required = { "summary" }, additionalProperties = false },
   handler = function(input, ctx)
     local s = active
-    if closed or not s or ctx:task_id() ~= "main" or ctx:session_id() ~= s.owner
+    if closed or not s or s.starting or ctx:task_id() ~= "main" or ctx:session_id() ~= s.owner
       or (s.resume_parent and s.resume_parent ~= s.owner) or not nonblank(input.summary)
       or (not eligible(s) and s.status ~= "completed") then
       return { llm_output = "No matching active main-agent loop, or empty summary", is_error = true }
@@ -313,7 +336,7 @@ maki.api.register_tool({
     end
     local generation = s.generation
     local ok, err = persist(s)
-    if not ok or s.generation ~= generation or s.status ~= "completed" then
+    if not ok or active ~= s or s.generation ~= generation or s.status ~= "completed" then
       return { llm_output = "Completion not durably acknowledged: " .. tostring(err or "revoked"), is_error = true }
     end
     return { llm_output = "Loop completed: " .. s.summary }
@@ -330,7 +353,7 @@ maki.api.create_autocmd({ "TurnStart", "TurnEnd", "TurnError", "SessionStatusCha
       if eligible(s) then interrupt(s, "Session teardown: " .. d.reason, true) end
       return
     end
-    if not s or d.session_id ~= (s.resume_parent or s.owner) then return end
+    if not s or s.starting or d.session_id ~= (s.resume_parent or s.owner) then return end
     if ev.event == "TurnEnd" and not s.ended then
       s.ended = true
       if type(d.cost) == "number" and d.cost >= 0 and d.cost < math.huge then
