@@ -1,6 +1,9 @@
 min_maki_version = "0.5.7"
 
 [permissions]
+# maki 0.6.4+ gates maki.session.prompt behind `agent`.
+# Older versions ignore the key, so the floor stays at 0.5.7.
+agent = true
 fs_read = true
 fs_write = true
 net = false

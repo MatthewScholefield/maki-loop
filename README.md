@@ -16,7 +16,7 @@ Requires maki 0.5.7+ with `maki.pack` support, Git, and the interactive TUI in b
 
    If you use the legacy `~/.maki/` config directory, edit its `init.lua` instead. Package installation is global; don't put this in a project's `.maki/init.lua`.
 
-2. Start maki and accept the package installation and permission prompts. The plugin requests only `fs_read` and `fs_write` to save and restore per-project loop state. It does not request network, process, or environment access.
+2. Start maki and accept the package installation and permission prompts. The plugin requests `fs_read` and `fs_write` to save and restore per-project loop state, plus `agent` on maki 0.6.4+ (needed to send the next prompt with `maki.session.prompt`; older versions ignore the key). It does not request network, process, or environment access.
 3. Use `/loop` in a build-mode session.
 
 No copying files, extra `require`, or changes to your config's `plugin.toml` are needed. Maki loads `plugin/loop.lua` automatically, keeps the checkout in its managed data directory, and pins the installed commit in your global config's `pack-lock.json`.
