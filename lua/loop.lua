@@ -1,4 +1,5 @@
 local states, timer, active, loading = {}, nil, nil, false
+local handoffs = {}
 local writes = maki.async.semaphore(1)
 local closed, command_generation = false, 0
 local schedule
@@ -132,6 +133,7 @@ local function project()
   end
   if count ~= s.iteration or s.sessions[s.iteration].id ~= s.owner then return nil, cwd, "Invalid owner record" end
   if closed or command_generation ~= generation then return nil, cwd, "revoked" end
+  s.handoff, s.wake = nil, nil
   states[cwd] = s
   if eligible(s) then
     revoke(s, "interrupted", "Restart/reload requires explicit /loop-resume")
@@ -206,22 +208,29 @@ end
 
 schedule = function(s)
   if closed or s.status ~= "rollover_pending" then return end
-  if s.handoff then s.wake = true; return end
+  local handoff = handoffs[s]
+  if handoff and handoff.guard() then handoff.wake = true; return end
   if timer then return end
   local guard = token(s)
   timer = maki.defer_fn(function()
     timer = nil
     if not guard() then return end
-    s.handoff = true
-    local parent = s.resume_parent or s.owner
-    local snapshot = call(s, guard, maki.session.read, { session = parent })
-    if snapshot then
-      local reason = check(snapshot, s.cwd, false)
-      if reason then interrupt(s, reason)
-      elseif snapshot.status == "idle" then fresh(s, guard, parent) end
+    local pending, generation = { guard = guard }, s.generation
+    handoffs[s] = pending
+    local ok, err = pcall(function()
+      local parent = s.resume_parent or s.owner
+      local snapshot = call(s, guard, maki.session.read, { session = parent })
+      if snapshot then
+        local reason = check(snapshot, s.cwd, false)
+        if reason then interrupt(s, reason)
+        elseif snapshot.status == "idle" then fresh(s, guard, parent) end
+      end
+    end)
+    if handoffs[s] == pending then handoffs[s] = nil end
+    if not ok and not closed and active == s and s.generation == generation then
+      interrupt(s, "Handoff error: " .. tostring(err))
     end
-    s.handoff = false
-    if s.wake then s.wake = false; schedule(s) end
+    if pending.wake and guard() then schedule(s) end
   end, 0)
 end
 
@@ -252,6 +261,11 @@ local function start(opts, resume, command_token)
     if cwd then cwd = maki.fs.normalize(cwd); s = states[cwd] end
   end
   if err or not cwd then maki.notify(tostring(err or "cwd unavailable"), "error"); return end
+  if resume and active == s and s and s.status == "rollover_pending" then
+    schedule(s)
+    maki.notify("Loop rollover rechecked; waiting for the owning session to become idle.")
+    return
+  end
   if resume and (eligible(active) or eligible(s)) then maki.notify("A loop is already active", "warn"); return end
   if resume and (not s or s.status == "completed") then maki.notify("No resumable loop in this project", "warn"); return end
   local parent

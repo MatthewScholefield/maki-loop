@@ -561,6 +561,45 @@ test("reload can resume an in-flight turn explicitly", function()
   reload.finish(); reload.tick(); eq(reload.created, 1)
 end)
 
+test("resume rechecks a pending rollover without an idle event", function()
+  local h = started(); h.finish("finished", "working"); h.tick()
+  eq(h.saved().status, "rollover_pending"); eq(h.created, 0)
+  h.sessions.s1.status = "idle"
+  h.command("loop-resume"); h.tick()
+  eq(h.created, 1); eq(h.saved().iteration, 2); eq(#h.prompts, 2)
+end)
+
+for _, status in ipairs({ "idle", "working" }) do
+  test("reload discards persisted handoff flags before " .. status .. " resume", function()
+    local h = started(); h.finish()
+    local _, text = next(h.files)
+    h.json[text].handoff, h.json[text].wake = true, true
+    local reload = host(h.files, h.json)
+    reload.sessions.s1.status = status
+    reload.command("loop-resume")
+    if status == "working" then reload.finish(); reload.tick() end
+    eq(reload.created, 1); eq(reload.saved().iteration, 2)
+    eq(reload.saved().handoff, nil); eq(reload.saved().wake, nil)
+    reload.finish(); reload.tick(); eq(reload.created, 2)
+  end)
+end
+
+test("handoff execution flags are never persisted", function()
+  local h = started(); h.finish(); h.tick()
+  eq(h.created, 1); eq(h.saved().handoff, nil); eq(h.saved().wake, nil)
+end)
+
+test("unexpected handoff errors interrupt instead of wedging resume", function()
+  local h = started(); h.finish()
+  local original = maki.session.read
+  maki.session.read = function() error("unexpected read failure") end
+  h.tick()
+  eq(h.saved().status, "interrupted"); eq(h.created, 0)
+  assert(h.saved().reason:find("unexpected read failure", 1, true))
+  maki.session.read = original
+  h.command("loop-resume"); eq(h.created, 1)
+end)
+
 test("question suspension and answer do not end iteration", function()
   local h = started()
   h.sessions.s1.status = "needs_input"
