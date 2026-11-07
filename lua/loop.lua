@@ -121,7 +121,7 @@ local function project()
   text, err = maki.fs.read(dir .. "/state.json")
   if err or not text then return nil, cwd, err or "state read failed" end
   local s
-  s, err = maki.json.decode(text)
+  s, err = maki.json.decode(text, { luanil = { object = true, array = true } })
   if err or not valid(s, cwd) then return nil, cwd, "Corrupt or unsupported loop state" end
   local count = 0
   for i, record in pairs(s.sessions) do

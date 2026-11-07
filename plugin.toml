@@ -3,6 +3,11 @@ min_maki_version = "0.5.7"
 [permissions]
 fs_read = true
 fs_write = true
+agent = true
+session_write = true
+session_settings = true
+session_read = false
+input = false
 net = false
 run = false
 env = false

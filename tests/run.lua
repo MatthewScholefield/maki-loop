@@ -9,6 +9,15 @@ local function eq(a, b)
   assert(a == b, tostring(a) .. " ~= " .. tostring(b))
 end
 
+local manifest = assert(io.open("plugin.toml", "r"))
+local permissions = {}
+for line in manifest:lines() do
+  local name, value = line:match("^([%w_]+)%s*=%s*(%a+)%s*$")
+  if name then permissions[name] = value == "true" end
+end
+manifest:close()
+local null = newproxy()
+
 local function host(files, json)
   local h = { files = files or {}, json = json or {}, commands = {}, tools = {}, events = {}, timers = {},
     ready = {}, notes = {}, sessions = {}, focus = "s1", created = 0, prompts = {}, calls = {}, fail = {}, detached = false }
@@ -69,7 +78,7 @@ local function host(files, json)
     assert(not h.detached, "UI call in teardown: " .. name)
     return h.point(name)
   end
-  local m = { api = {}, fs = {}, env = {}, uv = {}, session = {}, model = {}, task = {}, json = {}, async = {} }
+  local m = { NIL = null, api = {}, fs = {}, env = {}, uv = {}, session = {}, model = {}, task = {}, json = {}, async = {} }
   m.async.semaphore = function()
     local busy, waiters = false, {}
     return { acquire = function()
@@ -123,7 +132,20 @@ local function host(files, json)
     h.json[#h.json + 1], h.json[id] = id, copy(value)
     return id
   end
-  m.json.decode = function(text) if not h.json[text] then return nil, "malformed JSON" end; return copy(h.json[text]) end
+  m.json.decode = function(text, opts)
+    if h.json[text] == nil then return nil, "malformed JSON" end
+    local luanil = opts and opts.luanil or {}
+    local function decode(value)
+      if type(value) ~= "table" then return value end
+      local out = {}
+      for k, v in pairs(value) do
+        local drop = type(k) == "number" and luanil.array or type(k) == "string" and luanil.object
+        if v ~= null or not drop then out[k] = decode(v) end
+      end
+      return out
+    end
+    return decode(h.json[text])
+  end
   m.session.current = function() local err = ui("current"); if err then return nil, err end; return h.focus end
   m.session.read = function(opts)
     local err = ui("read")
@@ -142,6 +164,7 @@ local function host(files, json)
   m.model.get = function() local err = ui("model"); if err then return nil, err end; return copy(h.sessions[h.focus].settings) end
   m.task.list = function() local err = ui("tasks"); if err then return nil, err end; return copy(h.sessions[h.focus].tasks) end
   m.session.new = function(opts)
+    assert(permissions.session_write, "session_write permission required")
     assert(opts.prompt == nil)
     eq(opts.focus, false)
     local err = ui("new")
@@ -154,12 +177,14 @@ local function host(files, json)
     return s.id
   end
   m.session.set_mode = function(mode, opts)
+    assert(permissions.session_settings, "session_settings permission required")
     local err = ui("mode")
     if err then return nil, err end
     h.sessions[opts.session].mode = mode
     return true
   end
   m.session.prompt = function(text, opts)
+    assert(permissions.agent and permissions.session_write, "agent and session_write permissions required")
     local err = ui("prompt")
     if err then return nil, err end
     eq(h.saved().owner, opts.session)
@@ -194,6 +219,15 @@ local function test(name, fn)
   count = count + 1
   print("ok " .. count .. " - " .. name)
 end
+
+test("package declares only the capabilities used by loop", function()
+  for _, name in ipairs({ "fs_read", "fs_write", "agent", "session_write", "session_settings" }) do
+    eq(permissions[name], true)
+  end
+  for _, name in ipairs({ "session_read", "input", "net", "run", "env" }) do
+    eq(permissions[name], false)
+  end
+end)
 
 test("package entrypoint registers loop commands, tool, and lifecycle hooks", function()
   local h = host()
@@ -706,6 +740,38 @@ test("reload requires resume, project isolation and normalized keys", function()
   local n = 0; for path in pairs(next.files) do n = n + 1; assert(not path:find("/project", 1, true)) end
   eq(n, 2)
 end)
+
+test("JSON null optional state fields retain nil semantics on reload", function()
+  local h = started()
+  local _, text = next(h.files)
+  local s = h.json[text]
+  s.reason, s.resume_parent, s.summary = null, null, null
+  local reload = host(h.files, h.json)
+  reload.command("loop-status")
+  eq(reload.saved().status, "interrupted")
+  eq(reload.saved().resume_parent, nil)
+  eq(reload.saved().summary, nil)
+  reload.command("loop-resume")
+  eq(reload.created, 1)
+  eq(#reload.prompts, 1)
+  assert(not reload.complete("done").is_error)
+end)
+
+for _, field in ipairs({ "root", "objective", "sessions", "record", "summary" }) do
+  test("reject JSON null in required state " .. field, function()
+    local h = started()
+    local _, text = next(h.files)
+    local s = h.json[text]
+    if field == "root" then h.json[text] = null
+    elseif field == "record" then s.sessions[1] = null
+    elseif field == "summary" then s.status, s.summary = "completed", null
+    else s[field] = null end
+    local reload = host(h.files, h.json)
+    reload.command("loop-resume"); reload.tick()
+    eq(#reload.prompts, 0); eq(reload.created, 0)
+    assert(reload.notes[#reload.notes]:find("Corrupt", 1, true) or reload.notes[#reload.notes]:find("Invalid", 1, true))
+  end)
+end
 
 for _, corrupt in ipairs({ "json", "version", "owner", "cost", "objective", "records", "summary", "cwd", "resume_parent",
   "sparse", "object", "mixed", "zero", "negative", "fractional", "extra", "empty" }) do
