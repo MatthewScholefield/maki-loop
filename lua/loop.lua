@@ -185,7 +185,7 @@ local function fresh(s, guard, parent, initial)
   if not snapshot then return end
   if initial then reason = environment(snapshot, s.cwd) else reason = check(snapshot, s.cwd, true) end
   if reason then interrupt(s, reason); return end
-  local id = call(s, guard, maki.session.new, { focus = false })
+  local id = call(s, guard, maki.session.new, { focus = true })
   if not id then return end
   s.owner, s.iteration, s.status = id, initial and 1 or s.iteration + 1, "running"
   s.reason, s.ended, s.expect_start, s.tasks, s.resume_parent, s.starting = nil, false, false, {}, nil, nil

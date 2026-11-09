@@ -166,7 +166,7 @@ local function host(files, json)
   m.session.new = function(opts)
     assert(permissions.session_write, "session_write permission required")
     assert(opts.prompt == nil)
-    eq(opts.focus, false)
+    eq(opts.focus, true)
     local err = ui("new")
     if err then return nil, err end
     h.created = h.created + 1
@@ -174,6 +174,7 @@ local function host(files, json)
     s.id, s.status, s.queue, s.tasks = "n" .. h.created, "idle", { count = 0 }, { { id = "main" } }
     if h.new_mutate then h.new_mutate(s) end
     h.sessions[s.id] = s
+    if opts.focus then h.focus = s.id end
     return s.id
   end
   m.session.set_mode = function(mode, opts)
