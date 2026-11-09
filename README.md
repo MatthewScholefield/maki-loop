@@ -16,7 +16,7 @@ Requires maki 0.5.7+ with `maki.pack` support, Git, and the interactive TUI in b
 
    If you use the legacy `~/.maki/` config directory, edit its `init.lua` instead. Package installation is global; don't put this in a project's `.maki/init.lua`.
 
-2. Start maki and accept the package installation and permission prompts. The plugin requests `fs_read` and `fs_write` to save and restore per-project loop state, `agent` to start iteration turns, `session_write` to create sessions and submit prompts, and `session_settings` to put new iterations in build mode. It does not request conversation-content read, chat-input editing, network, process, or environment access. Existing installations must approve the added permissions when updating.
+2. Start maki and accept the package installation and permission prompts. The plugin requests `fs_read` and `fs_write` to save and restore per-project loop state, `agent` to start iteration turns, `session_write` to create sessions and submit prompts, `session_settings` to put new iterations in build mode, and `session_read` to distinguish empty-text background wakeups from manual follow-up turns. It does not request chat-input editing, network, process, or environment access. Existing installations must approve the added permissions when updating.
 3. Use `/loop` in a build-mode session.
 
 No copying files, extra `require`, or changes to your config's `plugin.toml` are needed. Maki loads `plugin/loop.lua` automatically, keeps the checkout in its managed data directory, and pins the installed commit in your global config's `pack-lock.json`.
@@ -57,7 +57,7 @@ Use `/loop-forever <prompt>` to repeat a prompt indefinitely instead. Each itera
 - `/loop-stop` — stop continuation without cancelling current work.
 - `/loop-resume` — resume a stopped or interrupted loop in a fresh session. During an active turn, arm continuation for when that turn finishes normally without cancelling it.
 
-For both loop modes, if an iteration finishes normally with background tasks still running, the plugin sends a follow-up in the same session asking the agent to wait for important tasks or cancel unneeded ones with `task_stop`. Once that work is resolved and the session is idle, the next iteration starts in a fresh session. The plugin does not forcibly cancel tasks itself.
+For both loop modes, an iteration that finishes normally with background tasks still running waits for their completion notifications. Background-result wakeups continue the same iteration rather than interrupting the loop. Only after 15 minutes waiting on background work does the plugin send a follow-up asking whether the tasks are hanging or still doing useful work worth waiting for. The agent can wait or cancel hung/unneeded tasks with `task_stop`; the plugin does not forcibly cancel tasks itself. A new turn cancels the pending reminder, and another normal finish with remaining tasks starts a new 15-minute wait. Once the work is resolved and the session is idle, the next iteration starts in a fresh session.
 
 Errors, cancellation, or conflicting user work interrupt continuation. Restarting or reloading requires an explicit resume.
 

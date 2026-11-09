@@ -1,5 +1,6 @@
 local states, timer, active, loading = {}, nil, nil, false
-local handoffs = {}
+local handoffs, nudges = {}, {}
+local nudge_delay = 15 * 60 * 1000
 local writes = maki.async.semaphore(1)
 local closed, command_generation = false, 0
 local schedule
@@ -62,7 +63,14 @@ local function eligible(s)
   return s and (s.status == "running" or s.status == "rollover_pending")
 end
 
+local function clear_nudge(s)
+  local pending = nudges[s]
+  if pending and pending.timer then pending.timer:stop() end
+  nudges[s] = nil
+end
+
 local function revoke(s, status, reason)
+  clear_nudge(s)
   s.generation = s.generation + 1
   s.status, s.reason = status, reason
   if timer then timer:stop(); timer = nil end
@@ -183,6 +191,17 @@ local function fresh(s, guard, parent, initial)
     end
     if next(working) then
       if not s.ended then interrupt(s, "Active subagent during handoff"); return end
+      local pending = nudges[s]
+      if not pending then
+        pending = {}
+        nudges[s] = pending
+        pending.timer = maki.defer_fn(function()
+          if nudges[s] ~= pending or not guard() or s.status ~= "rollover_pending" then return end
+          pending.ready = true
+          schedule(s)
+        end, nudge_delay)
+      end
+      if not pending.ready then return end
       snapshot = call(s, guard, maki.session.read, { session = parent })
       if not snapshot then return end
       reason = check(snapshot, s.cwd, false)
@@ -191,15 +210,18 @@ local function fresh(s, guard, parent, initial)
       local ids = {}
       for id in pairs(working) do ids[#ids + 1] = id end
       table.sort(ids)
-      s.status, s.expect_start = "running", true
+      clear_nudge(s)
+      s.status = "running"
       if not call(s, guard, persist, s) then return end
+      s.expect_start = true
       local result = call(s, guard, maki.session.prompt,
-        "There are still background tasks running after this loop iteration: " .. table.concat(ids, ", ")
-          .. ". Wait for them if they are important, or cancel unneeded tasks you own with task_stop. Resolve the remaining background work before finishing this turn; do not start another iteration of the objective yet.",
+        "I see there are still background tasks running after 15 minutes waiting for this loop iteration: " .. table.concat(ids, ", ")
+          .. ". Are they hanging, or still doing active work we should block on? Check their progress, wait if the work is useful, or cancel hung or unneeded tasks you own with task_stop. Do not start another iteration of the objective yet.",
         { session = parent })
       if result and result ~= "started" and result ~= "queued" then interrupt(s, "Unexpected cleanup prompt result") end
       return
     end
+    clear_nudge(s)
     if snapshot.status ~= "idle" then return end
   end
   local model = call(s, guard, maki.model.get)
@@ -414,7 +436,15 @@ maki.api.create_autocmd({ "TurnStart", "TurnEnd", "TurnError", "SessionStatusCha
     end
     if not eligible(s) then return end
     if ev.event == "TurnStart" then
-      if s.status == "running" and s.expect_start then s.expect_start, s.ended = false, false
+      if d.text == "" then
+        clear_nudge(s)
+        if timer then timer:stop(); timer = nil end
+        s.generation = s.generation + 1
+        s.status, s.ended = "running", false
+        call(s, token(s), persist, s)
+      elseif s.status == "running" and s.expect_start then
+        clear_nudge(s)
+        s.expect_start, s.ended = false, false
       else interrupt(s, "Manual follow-up turn") end
     elseif ev.event == "TurnError" then interrupt(s, "Turn error: " .. tostring(d.message))
     elseif ev.event == "SessionEnd" or ev.event == "SessionReset" then interrupt(s, "Session lifecycle: " .. tostring(d.reason or ev.event), true)

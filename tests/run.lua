@@ -20,7 +20,7 @@ local null = newproxy()
 
 local function host(files, json)
   local h = { files = files or {}, json = json or {}, commands = {}, tools = {}, events = {}, timers = {},
-    ready = {}, notes = {}, sessions = {}, focus = "s1", created = 0, prompts = {}, calls = {}, fail = {}, detached = false }
+    now = 0, ready = {}, notes = {}, sessions = {}, focus = "s1", created = 0, prompts = {}, calls = {}, fail = {}, detached = false }
   h.sessions.s1 = { id = "s1", cwd = "/project", model = "provider/model", mode = "build", status = "idle",
     queue = { count = 0 }, updated_at = 1, settings = { spec = "provider/model", thinking = "high", fast = false },
     tasks = { { id = "main" } }, workflow = "default", yolo = true }
@@ -62,11 +62,19 @@ local function host(files, json)
     h.drain()
     return result
   end
-  function h.tick()
+  function h.tick(ms)
+    h.now = h.now + (ms or 0)
     local timers = h.timers
     h.timers = {}
-    for _, t in ipairs(timers) do if not t.stopped then h.spawn(t.fn) end end
+    for _, t in ipairs(timers) do
+      if not t.stopped then
+        if t.at <= h.now then h.spawn(t.fn) else h.timers[#h.timers + 1] = t end
+      end
+    end
     h.drain()
+  end
+  function h.nudge()
+    h.tick(15 * 60 * 1000); h.tick()
   end
   function h.finish(reason, status, session)
     session = session or h.focus
@@ -93,8 +101,8 @@ local function host(files, json)
   m.api.create_autocmd = function(events, opts) for _, e in ipairs(events) do h.events[e] = opts.callback end end
   m.notify = function(text) assert(not h.detached, "notice in teardown"); h.notes[#h.notes + 1] = text end
   m.defer_fn = function(fn, ms)
-    eq(ms, 0)
-    local t = { fn = fn, stop = function(self) self.stopped = true end }
+    assert(ms == 0 or ms == 15 * 60 * 1000)
+    local t = { fn = fn, at = h.now + ms, stop = function(self) self.stopped = true end }
     h.timers[#h.timers + 1] = t
     return t
   end
@@ -222,10 +230,10 @@ local function test(name, fn)
 end
 
 test("package declares only the capabilities used by loop", function()
-  for _, name in ipairs({ "fs_read", "fs_write", "agent", "session_write", "session_settings" }) do
+  for _, name in ipairs({ "fs_read", "fs_write", "agent", "session_write", "session_settings", "session_read" }) do
     eq(permissions[name], true)
   end
-  for _, name in ipairs({ "session_read", "input", "net", "run", "env" }) do
+  for _, name in ipairs({ "input", "net", "run", "env" }) do
     eq(permissions[name], false)
   end
 end)
@@ -769,6 +777,9 @@ for _, command in ipairs({ "loop", "loop-forever" }) do
         h.prompt_result = result
         h.finish("finished", "working")
         h.emit("SessionStatusChanged", { session_id = "s1", status = "working" }); h.drain(); h.tick()
+        eq(#h.prompts, 1); eq(h.created, 0)
+        h.tick(15 * 60 * 1000 - 1); h.tick(); eq(#h.prompts, 1)
+        h.tick(1); h.tick()
         eq(h.created, 0); eq(#h.prompts, 2); eq(h.prompts[2].owner, "s1")
         assert(h.prompts[2].text:find("bg", 1, true)); assert(h.prompts[2].text:find("task_stop", 1, true))
         eq(h.saved().iteration, 1); eq(h.saved().status, "running")
@@ -790,12 +801,129 @@ for _, command in ipairs({ "loop", "loop-forever" }) do
   end
 end
 
+for _, command in ipairs({ "loop", "loop-forever" }) do
+  test(command .. " background wakeup cancels the nudge and continues the iteration", function()
+    local h = host(); h.command(command, "objective")
+    h.sessions.s1.tasks[2] = { id = "bg", status = "working" }
+    h.finish("finished", "working"); h.tick(); h.tick(14 * 60 * 1000)
+    h.sessions.s1.tasks[2].status = "done"
+    h.emit("TaskStatusChanged", { session_id = "s1", id = "bg", status = "done" })
+    h.emit("TurnStart", { session_id = "s1", text = "" }); h.drain()
+    eq(h.saved().status, "running"); eq(h.saved().iteration, 1)
+    h.nudge(); eq(#h.prompts, 1); eq(h.created, 0)
+    h.finish(); h.tick()
+    eq(h.created, 1); eq(#h.prompts, 2); eq(h.saved().cost_reports, 2)
+    eq(h.prompts[2].text, h.prompts[1].text)
+  end)
+
+  test(command .. " starts a fresh wait after a background wakeup finishes", function()
+    local h = host(); h.command(command, "objective")
+    h.sessions.s1.tasks[2] = { id = "bg", status = "working" }
+    h.finish("finished", "working"); h.tick(); h.tick(14 * 60 * 1000)
+    h.emit("TurnStart", { session_id = "s1", text = "" }); h.drain()
+    h.finish("finished", "working"); h.tick()
+    h.tick(14 * 60 * 1000); h.tick(); eq(#h.prompts, 1)
+    h.tick(60 * 1000); h.tick(); eq(#h.prompts, 2)
+    assert(h.prompts[2].text:find("hanging", 1, true))
+    assert(h.prompts[2].text:find("active work we should block on", 1, true))
+  end)
+end
+
+for _, point in ipairs({ "read", "focus", "current", "tasks", "model" }) do
+  test("background wakeup revokes in-flight rollover at " .. point, function()
+    local h = started(); h.finish()
+    local fired = false
+    h.hook = function(name)
+      if fired or name ~= point then return end
+      fired = true
+      h.sessions.s1.status = "working"
+      h.emit("TurnStart", { session_id = "s1", text = "" })
+    end
+    h.tick(); h.tick(); assert(fired)
+    eq(h.created, 0); eq(h.saved().status, "running")
+    h.hook = nil
+    h.finish(); h.tick(); eq(h.created, 1)
+  end)
+end
+
+for _, action in ipairs({ "stop", "complete", "manual", "missing_text", "reload", "replace" }) do
+  test("pending nudge is revoked by " .. action, function()
+    local h = started(); h.sessions.s1.tasks[2] = { id = "bg", status = "working" }
+    h.finish("finished", "working"); h.tick()
+    if action == "stop" then h.command("loop-stop")
+    elseif action == "complete" then h.complete("done")
+    elseif action == "manual" then h.emit("TurnStart", { session_id = "s1", text = "do something else" })
+    elseif action == "missing_text" then h.emit("TurnStart", { session_id = "s1" })
+    elseif action == "reload" then h.emit("SessionEnd", { session_id = "s1", reason = "reload" })
+    else h.command("loop-forever", "replacement") end
+    h.drain()
+    local prompts = #h.prompts
+    h.nudge(); eq(#h.prompts, prompts)
+    if action == "manual" or action == "missing_text" then eq(h.saved().status, "interrupted") end
+  end)
+end
+
+test("task status updates do not postpone or duplicate the nudge", function()
+  local h = started(); h.sessions.s1.tasks[2] = { id = "bg", status = "working" }
+  h.finish("finished", "working"); h.tick()
+  for _ = 1, 14 do
+    h.tick(60 * 1000)
+    h.emit("TaskStatusChanged", { session_id = "s1", id = "bg", status = "working" })
+    h.emit("SessionStatusChanged", { session_id = "s1", status = "working" })
+    h.drain(); h.tick(); eq(#h.prompts, 1)
+  end
+  h.tick(60 * 1000); h.tick(); eq(#h.prompts, 2)
+  h.nudge(); eq(#h.prompts, 2)
+end)
+
+for _, point in ipairs({ "read", "tasks", "mkdir", "write" }) do
+  test("background wakeup revokes a due nudge at " .. point, function()
+    local h = started(); h.sessions.s1.tasks[2] = { id = "bg", status = "working" }
+    h.finish("finished", "working"); h.tick()
+    local fired = false
+    h.hook = function(name)
+      if fired or name ~= point then return end
+      fired = true
+      h.emit("TurnStart", { session_id = "s1", text = "" })
+    end
+    h.nudge(); assert(fired); eq(#h.prompts, 1); eq(h.saved().status, "running")
+    h.hook = nil
+    h.sessions.s1.tasks[2].status = "done"
+    h.finish(); h.tick(); eq(h.created, 1)
+  end)
+end
+
+test("finishing background work before the timeout avoids a nudge", function()
+  local h = started(); h.sessions.s1.tasks[2] = { id = "bg", status = "working" }
+  h.finish("finished", "working"); h.tick()
+  h.sessions.s1.tasks[2].status = "cancelled"; h.sessions.s1.status = "idle"
+  h.emit("TaskStatusChanged", { session_id = "s1", id = "bg", status = "cancelled" }); h.drain(); h.tick()
+  eq(h.created, 1); eq(#h.prompts, 2)
+  h.nudge(); eq(#h.prompts, 2)
+end)
+
+test("background wakeups after loop-stop do not revive continuation", function()
+  local h = started(); h.finish(); h.command("loop-stop")
+  h.emit("TurnStart", { session_id = "s1", text = "" }); h.drain()
+  h.finish(); h.nudge(); eq(h.created, 0); eq(h.saved().status, "stopped")
+end)
+
+test("queued nudge survives a background wakeup without another nudge", function()
+  local h = started(); h.sessions.s1.tasks[2] = { id = "bg", status = "working" }
+  h.finish("finished", "working"); h.tick(); h.prompt_result = "queued"; h.nudge()
+  h.emit("TurnStart", { session_id = "s1", text = "" }); h.drain()
+  h.emit("TurnStart", { session_id = "s1", text = h.prompts[2].text }); h.drain()
+  h.nudge(); eq(#h.prompts, 2); eq(h.saved().status, "running")
+  h.sessions.s1.tasks[2].status = "done"; h.prompt_result = nil
+  h.finish(); h.tick(); eq(h.created, 1)
+end)
+
 test("cleanup repeats only after another normally finished turn", function()
   local h = started()
   h.sessions.s1.tasks[2] = { id = "bg", status = "working" }
-  h.finish(); h.tick(); eq(#h.prompts, 2); eq(h.created, 0)
+  h.finish(); h.tick(); eq(#h.prompts, 1); h.nudge(); eq(#h.prompts, 2); eq(h.created, 0)
   h.tick(); eq(#h.prompts, 2)
-  h.finish(); h.tick(); eq(#h.prompts, 3); eq(h.created, 0)
+  h.finish(); h.tick(); eq(#h.prompts, 2); h.nudge(); eq(#h.prompts, 3); eq(h.created, 0)
   h.finish("cancelled"); h.tick()
   eq(#h.prompts, 3); eq(h.saved().status, "interrupted")
 end)
@@ -823,7 +951,7 @@ test("cleanup targets an armed resume parent rather than the old owner", functio
   local h = started(); h.command("loop-stop")
   h.sessions.other = copy(h.sessions.s1); h.sessions.other.id = "other"; h.focus = "other"
   h.sessions.other.tasks[2] = { id = "bg", status = "working" }
-  h.command("loop-resume"); h.finish("finished", "working"); h.tick()
+  h.command("loop-resume"); h.finish("finished", "working"); h.tick(); h.nudge()
   eq(#h.prompts, 2); eq(h.prompts[2].owner, "other"); eq(h.created, 0)
   h.sessions.other.tasks[2].status = "done"
   h.finish(); h.tick(); eq(h.created, 1); eq(h.saved().iteration, 2)
@@ -832,8 +960,8 @@ end)
 for _, failure in ipairs({ "write", "prompt" }) do
   test("cleanup failure interrupts on " .. failure, function()
     local h = started(); h.sessions.s1.tasks[2] = { id = "bg", status = "working" }
-    h.finish("finished", "working"); h.fail[failure] = "cleanup failure"
-    h.tick(); h.fail[failure] = nil
+    h.finish("finished", "working"); h.tick(); h.fail[failure] = "cleanup failure"
+    h.nudge(); h.fail[failure] = nil
     h.command("loop-status"); assert(h.notes[#h.notes]:find("interrupted", 1, true))
     h.tick(); eq(#h.prompts, 1); eq(h.created, 0)
   end)
@@ -842,14 +970,14 @@ end
 for _, point in ipairs({ "focus", "current", "read", "tasks", "mkdir", "write" }) do
   test("stop racing cleanup at " .. point, function()
     local h = started(); h.sessions.s1.tasks[2] = { id = "bg", status = "working" }
-    h.finish("finished", "working")
+    h.finish("finished", "working"); h.tick()
     local fired = false
     h.hook = function(name)
       if fired or name ~= point then return end
       fired = true
       h.spawn(function() h.commands["loop-stop"].handler({}) end)
     end
-    h.tick(); h.tick(); assert(fired)
+    h.nudge(); h.tick(); assert(fired)
     eq(#h.prompts, 1); eq(h.created, 0); eq(h.saved().status, "stopped")
   end)
 end
