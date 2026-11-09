@@ -169,17 +169,38 @@ local function fresh(s, guard, parent, initial)
   local snapshot = call(s, guard, maki.session.read, { session = parent })
   if not snapshot then return end
   local reason
-  if initial then reason = environment(snapshot, s.cwd) else reason = check(snapshot, s.cwd, true) end
+  if initial then reason = environment(snapshot, s.cwd) else reason = check(snapshot, s.cwd, false) end
   if reason then interrupt(s, reason); return end
   if not initial then
-    for _, status in pairs(s.tasks) do
-      if status == "working" then interrupt(s, "Active subagent during handoff"); return end
-    end
     local tasks = call(s, guard, maki.task.list)
     if not tasks then return end
-    for _, task in ipairs(tasks) do
-      if task.id ~= "main" and task.status == "working" then interrupt(s, "Active subagent during handoff"); return end
+    local working = {}
+    for id, status in pairs(s.tasks) do
+      if id ~= "main" and status == "working" then working[id] = true end
     end
+    for _, task in ipairs(tasks) do
+      if task.id ~= "main" then working[task.id] = task.status == "working" and not task.wrapper or nil end
+    end
+    if next(working) then
+      if not s.ended then interrupt(s, "Active subagent during handoff"); return end
+      snapshot = call(s, guard, maki.session.read, { session = parent })
+      if not snapshot then return end
+      reason = check(snapshot, s.cwd, false)
+      if reason then interrupt(s, reason); return end
+      if snapshot.status == "needs_input" then return end
+      local ids = {}
+      for id in pairs(working) do ids[#ids + 1] = id end
+      table.sort(ids)
+      s.status, s.expect_start = "running", true
+      if not call(s, guard, persist, s) then return end
+      local result = call(s, guard, maki.session.prompt,
+        "There are still background tasks running after this loop iteration: " .. table.concat(ids, ", ")
+          .. ". Wait for them if they are important, or cancel unneeded tasks you own with task_stop. Resolve the remaining background work before finishing this turn; do not start another iteration of the objective yet.",
+        { session = parent })
+      if result and result ~= "started" and result ~= "queued" then interrupt(s, "Unexpected cleanup prompt result") end
+      return
+    end
+    if snapshot.status ~= "idle" then return end
   end
   local model = call(s, guard, maki.model.get)
   if not model then return end
@@ -228,7 +249,7 @@ schedule = function(s)
       if snapshot then
         local reason = check(snapshot, s.cwd, false)
         if reason then interrupt(s, reason)
-        elseif snapshot.status == "idle" then fresh(s, guard, parent) end
+        elseif snapshot.status ~= "needs_input" then fresh(s, guard, parent) end
       end
     end)
     if handoffs[s] == pending then handoffs[s] = nil end
@@ -393,7 +414,7 @@ maki.api.create_autocmd({ "TurnStart", "TurnEnd", "TurnError", "SessionStatusCha
     end
     if not eligible(s) then return end
     if ev.event == "TurnStart" then
-      if s.status == "running" and s.expect_start then s.expect_start = false
+      if s.status == "running" and s.expect_start then s.expect_start, s.ended = false, false
       else interrupt(s, "Manual follow-up turn") end
     elseif ev.event == "TurnError" then interrupt(s, "Turn error: " .. tostring(d.message))
     elseif ev.event == "SessionEnd" or ev.event == "SessionReset" then interrupt(s, "Session lifecycle: " .. tostring(d.reason or ev.event), true)
@@ -401,7 +422,7 @@ maki.api.create_autocmd({ "TurnStart", "TurnEnd", "TurnError", "SessionStatusCha
       s.tasks[d.id] = d.status
       if s.status == "rollover_pending" then schedule(s) end
     elseif ev.event == "SessionStatusChanged" and s.status == "rollover_pending" then
-      if d.status == "needs_input" or d.status == "working" then interrupt(s, "User work after terminal turn") else schedule(s) end
+      if d.status == "needs_input" then interrupt(s, "User work after terminal turn") else schedule(s) end
     end
   end,
 })

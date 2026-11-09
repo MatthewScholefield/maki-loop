@@ -188,11 +188,11 @@ local function host(files, json)
     assert(permissions.agent and permissions.session_write, "agent and session_write permissions required")
     local err = ui("prompt")
     if err then return nil, err end
-    eq(h.saved().owner, opts.session)
+    eq(h.saved().resume_parent or h.saved().owner, opts.session)
     eq(h.saved().status, "running")
     h.prompts[#h.prompts + 1] = { text = text, owner = opts.session }
     h.sessions[opts.session].status = "working"
-    h.emit("TurnStart", { session_id = opts.session, text = text })
+    if h.prompt_result ~= "queued" then h.emit("TurnStart", { session_id = opts.session, text = text }) end
     return h.prompt_result or "started"
   end
   _G.maki = m
@@ -636,7 +636,7 @@ for _, point in ipairs({ "read", "mkdir", "write" }) do
   end)
 end
 
-for _, action in ipairs({ "stop", "cancelled", "error", "queued", "task", "manual", "reload", "write" }) do
+for _, action in ipairs({ "stop", "cancelled", "error", "queued", "manual", "reload", "write" }) do
   test("armed resume is revoked by " .. action, function()
     local h = started(); h.command("loop-stop")
     if action == "write" then h.fail.write = "disk full" end
@@ -645,7 +645,6 @@ for _, action in ipairs({ "stop", "cancelled", "error", "queued", "task", "manua
     if action == "stop" then h.command("loop-stop")
     elseif action == "error" then h.emit("TurnError", { session_id = "s1", message = "provider failed" })
     elseif action == "queued" then h.sessions.s1.queue.count = 1
-    elseif action == "task" then h.sessions.s1.tasks[2] = { id = "sub", status = "working" }
     elseif action == "manual" then h.emit("TurnStart", { session_id = "s1" })
     elseif action == "reload" then h.emit("SessionEnd", { session_id = "s1", reason = "reload" }) end
     h.drain(); h.finish(action == "cancelled" and "cancelled" or "finished"); h.tick()
@@ -742,19 +741,116 @@ test("question suspension and answer do not end iteration", function()
   h.drain(); h.finish(); h.tick(); eq(h.created, 1)
 end)
 
-for _, case in ipairs({ "queued", "manual", "working", "needs_input", "task_event", "task_snapshot", "cwd", "plan" }) do
+for _, case in ipairs({ "queued", "manual", "needs_input", "cwd", "plan" }) do
   test("handoff rejects " .. case, function()
     local h = started(); h.finish()
     if case == "queued" then h.sessions.s1.queue.count = 1
     elseif case == "manual" then h.emit("TurnStart", { session_id = "s1" })
-    elseif case == "working" or case == "needs_input" then
+    elseif case == "needs_input" then
       h.sessions.s1.status = case
       h.emit("SessionStatusChanged", { session_id = "s1", status = case })
-    elseif case == "task_event" then h.emit("TaskStatusChanged", { session_id = "s1", id = "t", status = "working" })
-    elseif case == "task_snapshot" then h.sessions.s1.tasks[2] = { id = "t", status = "working" }
     elseif case == "cwd" then h.sessions.s1.cwd = "/other"
     elseif case == "plan" then h.sessions.s1.mode = "plan" end
     h.drain(); h.tick(); eq(h.created, 0); eq(h.saved().status, "interrupted")
+  end)
+end
+
+for _, command in ipairs({ "loop", "loop-forever" }) do
+  for _, source in ipairs({ "event", "snapshot" }) do
+    for _, result in ipairs({ "started", "queued" }) do
+      test(command .. " resolves background " .. source .. " work with " .. result .. " cleanup", function()
+        local h = host(); h.command(command, "original objective")
+        if source == "event" then
+          h.emit("TaskStatusChanged", { session_id = "s1", id = "bg", status = "working" }); h.drain()
+        else
+          h.sessions.s1.tasks[2] = { id = "bg", status = "working", tool = "bash" }
+        end
+        h.tick(); eq(#h.prompts, 1)
+        h.prompt_result = result
+        h.finish("finished", "working")
+        h.emit("SessionStatusChanged", { session_id = "s1", status = "working" }); h.drain(); h.tick()
+        eq(h.created, 0); eq(#h.prompts, 2); eq(h.prompts[2].owner, "s1")
+        assert(h.prompts[2].text:find("bg", 1, true)); assert(h.prompts[2].text:find("task_stop", 1, true))
+        eq(h.saved().iteration, 1); eq(h.saved().status, "running")
+        h.emit("TaskStatusChanged", { session_id = "s1", id = "bg", status = "working" })
+        h.drain(); h.tick(); h.tick(); eq(#h.prompts, 2)
+        if result == "queued" then
+          h.finish("finished", "working"); eq(h.saved().cost, 0.25)
+          h.emit("TurnStart", { session_id = "s1" }); h.drain()
+        end
+        h.sessions.s1.tasks[2] = { id = "bg", status = "cancelled" }
+        h.emit("TaskStatusChanged", { session_id = "s1", id = "bg", status = "cancelled" }); h.drain()
+        h.prompt_result = nil
+        h.finish(); h.tick()
+        eq(h.created, 1); eq(#h.prompts, 3); eq(h.saved().iteration, 2)
+        eq(h.saved().cost, 0.5); eq(h.saved().cost_reports, 2)
+        eq(h.prompts[3].text, h.prompts[1].text)
+      end)
+    end
+  end
+end
+
+test("cleanup repeats only after another normally finished turn", function()
+  local h = started()
+  h.sessions.s1.tasks[2] = { id = "bg", status = "working" }
+  h.finish(); h.tick(); eq(#h.prompts, 2); eq(h.created, 0)
+  h.tick(); eq(#h.prompts, 2)
+  h.finish(); h.tick(); eq(#h.prompts, 3); eq(h.created, 0)
+  h.finish("cancelled"); h.tick()
+  eq(#h.prompts, 3); eq(h.saved().status, "interrupted")
+end)
+
+test("cleanup does not revive a stopped or completed loop", function()
+  for _, action in ipairs({ "stop", "complete" }) do
+    local h = started()
+    h.sessions.s1.tasks[2] = { id = "bg", status = "working" }
+    if action == "stop" then h.command("loop-stop") else h.complete("done") end
+    h.finish(); h.tick(); eq(#h.prompts, 1); eq(h.created, 0)
+  end
+end)
+
+test("finished tasks and wrappers do not trigger cleanup from stale events", function()
+  local h = started()
+  h.emit("TaskStatusChanged", { session_id = "s1", id = "bg", status = "working" })
+  h.drain()
+  h.sessions.s1.tasks[2] = { id = "bg", status = "done" }
+  h.sessions.s1.tasks[3] = { id = "batch", status = "working", wrapper = true }
+  h.finish(); h.tick(); eq(h.created, 1); eq(#h.prompts, 2)
+  eq(h.prompts[2].text, h.prompts[1].text)
+end)
+
+test("cleanup targets an armed resume parent rather than the old owner", function()
+  local h = started(); h.command("loop-stop")
+  h.sessions.other = copy(h.sessions.s1); h.sessions.other.id = "other"; h.focus = "other"
+  h.sessions.other.tasks[2] = { id = "bg", status = "working" }
+  h.command("loop-resume"); h.finish("finished", "working"); h.tick()
+  eq(#h.prompts, 2); eq(h.prompts[2].owner, "other"); eq(h.created, 0)
+  h.sessions.other.tasks[2].status = "done"
+  h.finish(); h.tick(); eq(h.created, 1); eq(h.saved().iteration, 2)
+end)
+
+for _, failure in ipairs({ "write", "prompt" }) do
+  test("cleanup failure interrupts on " .. failure, function()
+    local h = started(); h.sessions.s1.tasks[2] = { id = "bg", status = "working" }
+    h.finish("finished", "working"); h.fail[failure] = "cleanup failure"
+    h.tick(); h.fail[failure] = nil
+    h.command("loop-status"); assert(h.notes[#h.notes]:find("interrupted", 1, true))
+    h.tick(); eq(#h.prompts, 1); eq(h.created, 0)
+  end)
+end
+
+for _, point in ipairs({ "focus", "current", "read", "tasks", "mkdir", "write" }) do
+  test("stop racing cleanup at " .. point, function()
+    local h = started(); h.sessions.s1.tasks[2] = { id = "bg", status = "working" }
+    h.finish("finished", "working")
+    local fired = false
+    h.hook = function(name)
+      if fired or name ~= point then return end
+      fired = true
+      h.spawn(function() h.commands["loop-stop"].handler({}) end)
+    end
+    h.tick(); h.tick(); assert(fired)
+    eq(#h.prompts, 1); eq(h.created, 0); eq(h.saved().status, "stopped")
   end)
 end
 

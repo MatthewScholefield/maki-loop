@@ -57,6 +57,8 @@ Use `/loop-forever <prompt>` to repeat a prompt indefinitely instead. Each itera
 - `/loop-stop` — stop continuation without cancelling current work.
 - `/loop-resume` — resume a stopped or interrupted loop in a fresh session. During an active turn, arm continuation for when that turn finishes normally without cancelling it.
 
+For both loop modes, if an iteration finishes normally with background tasks still running, the plugin sends a follow-up in the same session asking the agent to wait for important tasks or cancel unneeded ones with `task_stop`. Once that work is resolved and the session is idle, the next iteration starts in a fresh session. The plugin does not forcibly cancel tasks itself.
+
 Errors, cancellation, or conflicting user work interrupt continuation. Restarting or reloading requires an explicit resume.
 
 Warning: **There is currently no iteration or spending limit**; use carefully.
