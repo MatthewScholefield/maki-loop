@@ -232,7 +232,7 @@ end)
 
 test("package entrypoint registers loop commands, tool, and lifecycle hooks", function()
   local h = host()
-  for _, name in ipairs({ "loop", "loop-stop", "loop-status", "loop-resume" }) do
+  for _, name in ipairs({ "loop", "loop-forever", "loop-stop", "loop-status", "loop-resume" }) do
     assert(h.commands[name], "missing command: " .. name)
   end
   assert(h.tools.loop_complete)
@@ -276,6 +276,103 @@ test("raw objective, current context, fresh inheritance, duplicates, cost", func
   h.finish("finished", "idle", "s1"); h.tick()
   eq(h.created, 1); eq(h.saved().cost, 0.25)
 end)
+
+test("forever repeats the exact prompt and cannot complete", function()
+  local h = host()
+  local raw = "  work  in foo.md\nexactly  "
+  eq(h.commands["loop-forever"].nargs, "+")
+  h.command("loop-forever", raw)
+  eq(h.saved().forever, true)
+  eq(h.saved().objective, raw)
+  eq(h.prompts[1].owner, "s1")
+  for iteration = 1, 3 do
+    eq(h.prompts[iteration].text, raw)
+    eq(h.complete("everything is done").is_error, true)
+    eq(h.saved().status, "running"); eq(h.saved().summary, nil)
+    h.finish()
+    eq(h.complete("done after turn end").is_error, true)
+    h.tick()
+    eq(h.saved().iteration, iteration + 1)
+    eq(h.prompts[iteration + 1].text, raw)
+  end
+  eq(h.saved().cost, 0.75)
+  h.command("loop-status")
+  assert(h.notes[#h.notes]:find("Loop (forever)", 1, true))
+end)
+
+test("forever stop and resume preserve the raw prompt", function()
+  local h = host()
+  h.command("loop-forever", "raw prompt")
+  h.command("loop-stop")
+  eq(h.sessions.s1.status, "working")
+  h.finish(); h.tick(); eq(h.created, 0)
+  h.command("loop-resume")
+  eq(h.saved().forever, true); eq(h.saved().iteration, 2)
+  eq(h.prompts[2].text, "raw prompt")
+  eq(h.complete("done").is_error, true)
+end)
+
+test("forever reload requires resume and preserves its mode", function()
+  local h = host()
+  h.command("loop-forever", "raw prompt")
+  local reload = host(h.files, h.json)
+  reload.command("loop-status"); reload.tick()
+  eq(reload.saved().status, "interrupted"); eq(#reload.prompts, 0)
+  reload.command("loop-resume")
+  eq(reload.saved().forever, true)
+  eq(reload.prompts[1].text, "raw prompt")
+  eq(reload.complete("done").is_error, true)
+  reload.finish(); reload.tick()
+  eq(reload.prompts[2].text, "raw prompt")
+end)
+
+for _, status in ipairs({ "working", "needs_input", "queued", "plan" }) do
+  test("forever starts immediately from " .. status, function()
+    local h = host()
+    if status == "queued" then h.sessions.s1.queue.count = 2
+    elseif status == "plan" then h.sessions.s1.mode = "plan"
+    else h.sessions.s1.status = status end
+    local before = copy(h.sessions.s1)
+    h.command("loop-forever", "raw prompt")
+    eq(h.created, 1); eq(h.prompts[1].text, "raw prompt")
+    eq(h.sessions.n1.mode, "build")
+    eq(h.sessions.s1.status, before.status); eq(h.sessions.s1.mode, before.mode)
+    eq(h.sessions.s1.queue.count, before.queue.count)
+  end)
+end
+
+for _, name in ipairs({ "loop", "loop-forever" }) do
+  test(name .. " replaces the other mode and revokes pending continuation", function()
+    local h = host()
+    h.command(name == "loop" and "loop-forever" or "loop", "old")
+    h.finish()
+    h.command(name, "replacement"); h.tick()
+    eq(h.saved().forever, name == "loop-forever" and true or nil)
+    eq(h.saved().objective, "replacement"); eq(h.saved().iteration, 1)
+    eq(h.created, 1); eq(#h.prompts, 2)
+    if name == "loop-forever" then eq(h.prompts[2].text, "replacement")
+    else assert(h.prompts[2].text ~= "replacement") end
+    h.finish(); h.tick(); eq(h.saved().iteration, 2)
+  end)
+
+  test(name .. " rejects blank prompts without replacing active work", function()
+    local h = host()
+    h.command("loop-forever", "raw prompt")
+    h.command(name, " \n ")
+    eq(h.saved().objective, "raw prompt"); eq(h.saved().forever, true)
+    eq(#h.prompts, 1)
+    h.finish(); h.tick(); eq(h.prompts[2].text, "raw prompt")
+  end)
+end
+
+for _, reason in ipairs({ "cancelled", "max_tokens", "max_turns", "dropped" }) do
+  test("forever still interrupts on " .. reason, function()
+    local h = host()
+    h.command("loop-forever", "raw prompt")
+    h.finish(reason); h.tick()
+    eq(h.saved().status, "interrupted"); eq(h.created, 0)
+  end)
+end
 
 for _, case in ipairs({ "blank", "headless", "wrong" }) do
   test("reject start " .. case, function()
@@ -775,13 +872,15 @@ for _, field in ipairs({ "root", "objective", "sessions", "record", "summary" })
 end
 
 for _, corrupt in ipairs({ "json", "version", "owner", "cost", "objective", "records", "summary", "cwd", "resume_parent",
-  "sparse", "object", "mixed", "zero", "negative", "fractional", "extra", "empty" }) do
+  "sparse", "object", "mixed", "zero", "negative", "fractional", "extra", "empty", "forever", "forever_completed" }) do
   test("reject corrupt state " .. corrupt, function()
     local h = started()
     local path, text = next(h.files)
     local s = h.json[text]
     if corrupt == "json" then h.files[path] = "broken"
     elseif corrupt == "version" then s.version = 99
+    elseif corrupt == "forever" then s.forever = "true"
+    elseif corrupt == "forever_completed" then s.forever, s.status, s.summary = true, "completed", "done"
     elseif corrupt == "owner" then s.owner = "wrong"
     elseif corrupt == "resume_parent" then s.resume_parent = {}
     elseif corrupt == "cost" then s.cost = -1

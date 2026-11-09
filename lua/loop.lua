@@ -19,6 +19,8 @@ local function valid(s, cwd)
     and integer(s.generation) and integer(s.iteration) and s.iteration > 0
     and statuses[s.status] and type(s.cost) == "number" and s.cost >= 0 and s.cost < math.huge
     and integer(s.cost_reports) and type(s.sessions) == "table"
+    and (s.forever == nil or type(s.forever) == "boolean")
+    and (not s.forever or s.status ~= "completed")
     and (s.reason == nil or type(s.reason) == "string")
     and (s.resume_parent == nil or nonblank(s.resume_parent))
     and (s.summary == nil or nonblank(s.summary))
@@ -150,7 +152,10 @@ local function submit(s, guard)
   local reason = check(snapshot, s.cwd, true)
   if reason then interrupt(s, reason); return end
   s.expect_start = true
-  local prompt = "Loop iteration: complete one unit of work toward the objective below. Persist progress and verification in the user-specified files. Use normal question tools for ambiguity. Only call loop_complete with a completion summary when the ENTIRE objective is satisfied, not merely one task. Otherwise finish this turn normally; a fresh session will repeat the objective. No prior conversation or summary is supplied.\n\nOriginal objective (verbatim):\n" .. s.objective
+  local prompt = s.objective
+  if not s.forever then
+    prompt = "Loop iteration: complete one unit of work toward the objective below. Persist progress and verification in the user-specified files. Use normal question tools for ambiguity. Only call loop_complete with a completion summary when the ENTIRE objective is satisfied, not merely one task. Otherwise finish this turn normally; a fresh session will repeat the objective. No prior conversation or summary is supplied.\n\nOriginal objective (verbatim):\n" .. s.objective
+  end
   local result = call(s, guard, maki.session.prompt, prompt, { session = s.owner })
   if result and result ~= "started" then interrupt(s, "Prompt was queued instead of started") end
 end
@@ -237,10 +242,10 @@ end
 local function command(name, nargs, handler)
   maki.api.register_command({ name = name, nargs = nargs, description = name, handler = function(opts)
     if closed then return end
-    if name == "loop" then
+    if name == "loop" or name == "loop-forever" then
       if not nonblank(opts.args) then maki.notify("A nonblank objective is required", "warn"); return end
       command_generation = command_generation + 1
-      if eligible(active) then revoke(active, "stopped", "Superseded by a new /loop") end
+      if eligible(active) then revoke(active, "stopped", "Superseded by a new /" .. name) end
     elseif loading then maki.notify("Loop command already in progress", "warn"); return end
     local generation, pending = command_generation, {}
     loading = pending
@@ -253,7 +258,7 @@ local function command(name, nargs, handler)
   end })
 end
 
-local function start(opts, resume, command_token)
+local function start(opts, resume, command_token, forever)
   local s, cwd, err
   if resume then s, cwd, err = project()
   else
@@ -282,7 +287,7 @@ local function start(opts, resume, command_token)
     or snapshot.queue.count ~= 0 or snapshot.mode ~= "build")
   if not resume then
     s = { version = 1, cwd = cwd, objective = opts.args, id = parent .. ":" .. tostring(snapshot.updated_at),
-      generation = 0, iteration = 1, owner = parent, cost = 0, cost_reports = 0,
+      forever = forever, generation = 0, iteration = 1, owner = parent, cost = 0, cost_reports = 0,
       sessions = { { id = parent, iteration = 1 } } }
   end
   s.generation, s.status, s.reason = s.generation + 1, "running", nil
@@ -308,13 +313,14 @@ local function start(opts, resume, command_token)
 end
 
 command("loop", "+", function(opts, generation) start(opts, false, generation) end)
+command("loop-forever", "+", function(opts, generation) start(opts, false, generation, true) end)
 command("loop-resume", 0, function(opts, generation) start(opts, true, generation) end)
 command("loop-status", 0, function()
   local s, _, err = project()
   if err then maki.notify(tostring(err), "error"); return end
   if not s then maki.notify("No loop saved for this project"); return end
-  maki.notify(string.format("Loop %s | iteration %d | owner %s | reported cost %.6f (%d reports) | %s%s%s",
-    s.status, s.iteration, s.owner, s.cost, s.cost_reports, s.objective,
+  maki.notify(string.format("Loop%s %s | iteration %d | owner %s | reported cost %.6f (%d reports) | %s%s%s",
+    s.forever and " (forever)" or "", s.status, s.iteration, s.owner, s.cost, s.cost_reports, s.objective,
     s.reason and " | " .. s.reason or "", s.summary and " | " .. s.summary or ""))
 end)
 
@@ -335,10 +341,13 @@ end })
 
 maki.api.register_tool({
   name = "loop_complete", audiences = { "main" },
-  description = "End the entire active loop objective, only when all of it is satisfied. Provide a nonempty completion summary with evidence. Inert outside the owning main-agent iteration.",
+  description = "End the entire active loop objective, only when all of it is satisfied. Provide a nonempty completion summary with evidence. Inert outside the owning main-agent iteration and for /loop-forever.",
   schema = { type = "object", properties = { summary = { type = "string" } }, required = { "summary" }, additionalProperties = false },
   handler = function(input, ctx)
     local s = active
+    if s and s.forever then
+      return { llm_output = "Completion is disabled for /loop-forever; use /loop-stop to revoke continuation", is_error = true }
+    end
     if closed or not s or s.starting or ctx:task_id() ~= "main" or ctx:session_id() ~= s.owner
       or (s.resume_parent and s.resume_parent ~= s.owner) or not nonblank(input.summary)
       or (not eligible(s) and s.status ~= "completed") then

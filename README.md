@@ -51,6 +51,8 @@ Accept the removal prompt. Close any other maki processes still using the packag
 
 The agent calls `loop_complete` when the whole objective is done.
 
+Use `/loop-forever <prompt>` to repeat a prompt indefinitely instead. Each iteration receives exactly the supplied prompt, without any loop instructions, prefix, or suffix. `loop_complete` cannot end this mode; use `/loop-stop` to stop continuation. It uses the same fresh-session behavior and safety interruptions as `/loop`, and `/loop-resume` preserves the mode after stopping or reloading. Starting either command replaces the previous loop.
+
 - `/loop-status` — show progress and reported cost.
 - `/loop-stop` — stop continuation without cancelling current work.
 - `/loop-resume` — resume a stopped or interrupted loop in a fresh session. During an active turn, arm continuation for when that turn finishes normally without cancelling it.
