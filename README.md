@@ -51,7 +51,7 @@ Accept the removal prompt. Close any other maki processes still using the packag
 
 The agent calls `loop_complete` when the whole objective is done.
 
-Use `/loop-forever <prompt>` to repeat a prompt indefinitely instead. Each iteration receives exactly the supplied prompt, without any loop instructions, prefix, or suffix. `loop_complete` cannot end this mode; use `/loop-stop` to stop continuation. It uses the same fresh-session behavior and safety interruptions as `/loop`, and `/loop-resume` preserves the mode after stopping or reloading. Starting either command replaces the previous loop.
+Use `/loop-forever <prompt>` to repeat a prompt indefinitely instead. Each iteration receives exactly the supplied prompt, without any loop instructions, prefix, or suffix. `loop_complete` cannot end this mode; use `/loop-stop` to stop continuation. It uses the same fresh-session behavior as `/loop`, but cancellation, turn limits, dropped turns, provider errors, and manual follow-ups do not end continuation. Manual turns are allowed to finish, then the original prompt repeats in a fresh build-mode session; queued work and plan mode in the previous session are left untouched. `/loop-resume` preserves the mode after stopping or reloading. Starting either command replaces the previous loop.
 
 - `/loop-status` — show progress and reported cost.
 - `/loop-stop` — stop continuation without cancelling current work.
@@ -59,7 +59,7 @@ Use `/loop-forever <prompt>` to repeat a prompt indefinitely instead. Each itera
 
 For both loop modes, an iteration that finishes normally with background tasks still running waits for their completion notifications. Background-result wakeups continue the same iteration rather than interrupting the loop. Only after 15 minutes waiting on background work does the plugin send a follow-up asking whether the tasks are hanging or still doing useful work worth waiting for. The agent can wait or cancel hung/unneeded tasks with `task_stop`; the plugin does not forcibly cancel tasks itself. A new turn cancels the pending reminder, and another normal finish with remaining tasks starts a new 15-minute wait. Once the work is resolved and the session is idle, the next iteration starts in a fresh session.
 
-Errors, cancellation, or conflicting user work interrupt continuation. Restarting or reloading requires an explicit resume.
+For `/loop`, errors, cancellation, or conflicting user work interrupt continuation. Both modes still stop on session resets, host/persistence failures, or invalid session environments. Restarting or reloading requires an explicit resume.
 
 Warning: **There is currently no iteration or spending limit**; use carefully.
 

@@ -106,12 +106,12 @@ local function environment(snapshot, cwd)
   if maki.fs.normalize(snapshot.cwd) ~= cwd then return "Wrong project" end
 end
 
-local function check(snapshot, cwd, idle)
+local function check(snapshot, cwd, idle, forever)
   local reason = environment(snapshot, cwd)
   if reason then return reason end
-  if snapshot.mode ~= "build" then return "Switch to build mode before using loop" end
-  if snapshot.queue.count ~= 0 then return "Queued user work" end
-  if idle and snapshot.status ~= "idle" then return "Session is busy" end
+  if not forever and snapshot.mode ~= "build" then return "Switch to build mode before using loop" end
+  if not forever and snapshot.queue.count ~= 0 then return "Queued user work" end
+  if idle and snapshot.status ~= "idle" and not (forever and snapshot.status == "needs_input") then return "Session is busy" end
 end
 
 local function project()
@@ -177,7 +177,7 @@ local function fresh(s, guard, parent, initial)
   local snapshot = call(s, guard, maki.session.read, { session = parent })
   if not snapshot then return end
   local reason
-  if initial then reason = environment(snapshot, s.cwd) else reason = check(snapshot, s.cwd, false) end
+  if initial then reason = environment(snapshot, s.cwd) else reason = check(snapshot, s.cwd, false, s.forever) end
   if reason then interrupt(s, reason); return end
   if not initial then
     local tasks = call(s, guard, maki.task.list)
@@ -190,7 +190,7 @@ local function fresh(s, guard, parent, initial)
       if task.id ~= "main" then working[task.id] = task.status == "working" and not task.wrapper or nil end
     end
     if next(working) then
-      if not s.ended then interrupt(s, "Active subagent during handoff"); return end
+      if not s.ended and not s.forever then interrupt(s, "Active subagent during handoff"); return end
       local pending = nudges[s]
       if not pending then
         pending = {}
@@ -204,7 +204,7 @@ local function fresh(s, guard, parent, initial)
       if not pending.ready then return end
       snapshot = call(s, guard, maki.session.read, { session = parent })
       if not snapshot then return end
-      reason = check(snapshot, s.cwd, false)
+      reason = check(snapshot, s.cwd, false, s.forever)
       if reason then interrupt(s, reason); return end
       if snapshot.status == "needs_input" then return end
       local ids = {}
@@ -222,7 +222,7 @@ local function fresh(s, guard, parent, initial)
       return
     end
     clear_nudge(s)
-    if snapshot.status ~= "idle" then return end
+    if snapshot.status ~= "idle" and not (s.forever and snapshot.status == "needs_input") then return end
   end
   local model = call(s, guard, maki.model.get)
   if not model then return end
@@ -231,7 +231,7 @@ local function fresh(s, guard, parent, initial)
   if current ~= parent then interrupt(s, "Focus changed before creation"); return end
   snapshot = call(s, guard, maki.session.read, { session = parent })
   if not snapshot then return end
-  if initial then reason = environment(snapshot, s.cwd) else reason = check(snapshot, s.cwd, true) end
+  if initial then reason = environment(snapshot, s.cwd) else reason = check(snapshot, s.cwd, true, s.forever) end
   if reason then interrupt(s, reason); return end
   local id = call(s, guard, maki.session.new, { focus = true })
   if not id then return end
@@ -239,7 +239,7 @@ local function fresh(s, guard, parent, initial)
   s.reason, s.ended, s.expect_start, s.tasks, s.resume_parent, s.starting = nil, false, false, {}, nil, nil
   s.sessions[s.iteration] = { id = id, iteration = s.iteration }
   guard = token(s)
-  if initial and not call(s, guard, maki.session.set_mode, "build", { session = id }) then return end
+  if (initial or s.forever) and not call(s, guard, maki.session.set_mode, "build", { session = id }) then return end
   local saved = call(s, guard, persist, s)
   if not saved then return end
   ok = call(s, guard, maki.session.focus, id)
@@ -269,9 +269,9 @@ schedule = function(s)
       local parent = s.resume_parent or s.owner
       local snapshot = call(s, guard, maki.session.read, { session = parent })
       if snapshot then
-        local reason = check(snapshot, s.cwd, false)
+        local reason = check(snapshot, s.cwd, false, s.forever)
         if reason then interrupt(s, reason)
-        elseif snapshot.status ~= "needs_input" then fresh(s, guard, parent) end
+        elseif s.forever or snapshot.status ~= "needs_input" then fresh(s, guard, parent) end
       end
     end)
     if handoffs[s] == pending then handoffs[s] = nil end
@@ -323,7 +323,7 @@ local function start(opts, resume, command_token, forever)
   snapshot, err = maki.session.read({ session = parent })
   if err or not snapshot then maki.notify(tostring(err), "error"); return end
   local reason
-  if resume then reason = check(snapshot, cwd, false) else reason = environment(snapshot, cwd) end
+  if resume then reason = check(snapshot, cwd, false, s.forever) else reason = environment(snapshot, cwd) end
   if reason then maki.notify(reason, "warn"); return end
   if closed or command_generation ~= command_token then return end
   local initial = not resume and (s ~= nil or active ~= nil or snapshot.status ~= "idle"
@@ -345,7 +345,7 @@ local function start(opts, resume, command_token, forever)
     maki.notify("Loop resume armed; continuation will start in a fresh session after the current turn finishes normally.")
     local latest = call(s, guard, maki.session.read, { session = s.resume_parent })
     if not latest then return end
-    reason = check(latest, cwd, false)
+    reason = check(latest, cwd, false, s.forever)
     if reason then interrupt(s, reason); return end
     if s.status == "running" and latest.status == "idle" then
       s.status = "rollover_pending"
@@ -426,7 +426,7 @@ maki.api.create_autocmd({ "TurnStart", "TurnEnd", "TurnError", "SessionStatusCha
         s.cost, s.cost_reports = s.cost + d.cost, s.cost_reports + 1
       end
       if eligible(s) then
-        if d.reason ~= "finished" then interrupt(s, "Turn ended: " .. tostring(d.reason)); return end
+        if not s.forever and d.reason ~= "finished" then interrupt(s, "Turn ended: " .. tostring(d.reason)); return end
         s.status = "rollover_pending"
         local guard = token(s)
         if not call(s, guard, persist, s) then return end
@@ -436,7 +436,7 @@ maki.api.create_autocmd({ "TurnStart", "TurnEnd", "TurnError", "SessionStatusCha
     end
     if not eligible(s) then return end
     if ev.event == "TurnStart" then
-      if d.text == "" then
+      if d.text == "" or (s.forever and not s.expect_start) then
         clear_nudge(s)
         if timer then timer:stop(); timer = nil end
         s.generation = s.generation + 1
@@ -446,13 +446,18 @@ maki.api.create_autocmd({ "TurnStart", "TurnEnd", "TurnError", "SessionStatusCha
         clear_nudge(s)
         s.expect_start, s.ended = false, false
       else interrupt(s, "Manual follow-up turn") end
-    elseif ev.event == "TurnError" then interrupt(s, "Turn error: " .. tostring(d.message))
+    elseif ev.event == "TurnError" then
+      if s.forever then
+        s.status = "rollover_pending"
+        if not call(s, token(s), persist, s) then return end
+        schedule(s)
+      else interrupt(s, "Turn error: " .. tostring(d.message)) end
     elseif ev.event == "SessionEnd" or ev.event == "SessionReset" then interrupt(s, "Session lifecycle: " .. tostring(d.reason or ev.event), true)
     elseif ev.event == "TaskStatusChanged" then
       s.tasks[d.id] = d.status
       if s.status == "rollover_pending" then schedule(s) end
     elseif ev.event == "SessionStatusChanged" and s.status == "rollover_pending" then
-      if d.status == "needs_input" then interrupt(s, "User work after terminal turn") else schedule(s) end
+      if d.status == "needs_input" and not s.forever then interrupt(s, "User work after terminal turn") else schedule(s) end
     end
   end,
 })

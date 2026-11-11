@@ -374,11 +374,110 @@ for _, name in ipairs({ "loop", "loop-forever" }) do
 end
 
 for _, reason in ipairs({ "cancelled", "max_tokens", "max_turns", "dropped" }) do
-  test("forever still interrupts on " .. reason, function()
+  test("forever continues after " .. reason, function()
     local h = host()
     h.command("loop-forever", "raw prompt")
     h.finish(reason); h.tick()
-    eq(h.saved().status, "interrupted"); eq(h.created, 0)
+    eq(h.saved().status, "running"); eq(h.created, 1)
+    eq(h.prompts[2].text, "raw prompt"); eq(h.saved().cost, 0.25)
+    h.finish(reason, "idle", "s1"); h.tick()
+    eq(h.created, 1); eq(h.saved().cost_reports, 1)
+  end)
+end
+
+for _, ending in ipairs({ "idle", "needs_input", "working", "TurnEnd" }) do
+  test("forever recovers from a turn error followed by " .. ending, function()
+    local h = host(); h.command("loop-forever", "raw prompt")
+    h.emit("TurnError", { session_id = "s1", message = "provider failed" }); h.drain()
+    if ending == "TurnEnd" then h.finish("cancelled")
+    else h.sessions.s1.status = ending end
+    h.tick()
+    if ending == "working" then
+      eq(h.created, 0); eq(h.saved().status, "rollover_pending")
+      h.sessions.s1.status = "idle"
+      h.emit("SessionStatusChanged", { session_id = "s1", status = "idle" }); h.drain(); h.tick()
+    end
+    eq(h.created, 1); eq(h.saved().status, "running")
+    eq(h.prompts[2].text, "raw prompt")
+  end)
+end
+
+for _, text in ipairs({ "manual follow-up", false }) do
+  test("forever adopts manual turns with text " .. tostring(text), function()
+    local h = host(); h.command("loop-forever", "raw prompt"); h.finish()
+    h.sessions.s1.status = "working"
+    h.emit("TurnStart", { session_id = "s1", text = text or nil }); h.drain(); h.tick()
+    eq(h.created, 0); eq(h.saved().status, "running")
+    h.finish("cancelled"); h.tick()
+    eq(h.created, 1); eq(h.prompts[2].text, "raw prompt")
+    eq(h.saved().cost_reports, 2)
+  end)
+end
+
+for _, conflict in ipairs({ "queued", "plan", "needs_input" }) do
+  test("forever continues despite " .. conflict, function()
+    local h = host(); h.command("loop-forever", "raw prompt"); h.finish("cancelled")
+    if conflict == "queued" then h.sessions.s1.queue.count = 2
+    elseif conflict == "plan" then h.sessions.s1.mode = "plan"
+    else
+      h.sessions.s1.status = "needs_input"
+      h.emit("SessionStatusChanged", { session_id = "s1", status = "needs_input" }); h.drain()
+    end
+    local before = copy(h.sessions.s1)
+    h.tick()
+    eq(h.created, 1); eq(h.saved().status, "running")
+    eq(h.prompts[2].text, "raw prompt"); eq(h.sessions.n1.mode, "build")
+    eq(h.sessions.s1.queue.count, before.queue.count)
+    eq(h.sessions.s1.mode, before.mode); eq(h.sessions.s1.status, before.status)
+  end)
+end
+
+for _, point in ipairs({ "read", "focus", "current", "tasks", "model", "new", "mode", "mkdir", "write" }) do
+  test("forever stop revokes recovery at " .. point, function()
+    local h = host(); h.command("loop-forever", "raw prompt"); h.finish("cancelled")
+    local fired = false
+    h.hook = function(name)
+      if fired or name ~= point then return end
+      fired = true
+      h.spawn(function() h.commands["loop-stop"].handler({}) end)
+    end
+    h.tick(); h.tick(); assert(fired)
+    eq(h.saved().status, "stopped"); eq(#h.prompts, 1)
+  end)
+end
+
+for _, point in ipairs({ "read", "focus", "current", "tasks", "model" }) do
+  test("forever manual follow-up revokes in-flight rollover at " .. point, function()
+    local h = host(); h.command("loop-forever", "raw prompt"); h.finish("cancelled")
+    local fired = false
+    h.hook = function(name)
+      if fired or name ~= point then return end
+      fired = true
+      h.sessions.s1.status = "working"
+      h.emit("TurnStart", { session_id = "s1", text = "manual follow-up" })
+    end
+    h.tick(); h.tick(); assert(fired)
+    eq(h.created, 0); eq(h.saved().status, "running")
+    h.hook = nil
+    h.finish("cancelled"); h.tick()
+    eq(h.created, 1); eq(h.prompts[2].text, "raw prompt")
+  end)
+end
+
+for _, action in ipairs({ "reset", "reload", "write", "wrong" }) do
+  test("forever retains the " .. action .. " boundary", function()
+    local h = host(); h.command("loop-forever", "raw prompt"); h.finish("cancelled")
+    if action == "reset" then h.emit("SessionReset", { session_id = "s1" })
+    elseif action == "reload" then h.emit("SessionEnd", { session_id = "s1", reason = "reload" })
+    elseif action == "write" then h.fail.write = "disk full"
+    else h.sessions.s1.cwd = "/other" end
+    h.drain(); h.tick(); h.fail.write = nil
+    if action == "reload" then eq(h.saved().status, "interrupted")
+    else
+      h.command("loop-status")
+      assert(h.notes[#h.notes]:find("interrupted", 1, true))
+    end
+    eq(#h.prompts, 1)
   end)
 end
 
